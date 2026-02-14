@@ -341,7 +341,16 @@ def get_us_stock_symbols(qlib_data_path: [str, Path] = None) -> list:
         return _symbols
 
     if _US_SYMBOLS is None:
-        _all_symbols = _get_eastmoney() + _get_nasdaq() + _get_nyse()
+        # MODIFIED: eastmoney fallback — if any source fails, skip and continue
+        _all_symbols = []
+        for _func in [_get_eastmoney, _get_nasdaq, _get_nyse]:
+            try:
+                _all_symbols += _func()
+            except Exception as e:
+                logger.warning(f"{_func.__name__} failed, skipping: {e}")
+        if not _all_symbols:
+            logger.error("All US stock symbol sources failed, returning empty list")
+            return []
         if qlib_data_path is not None:
             for _index in ["nasdaq100", "sp500"]:
                 ins_df = pd.read_csv(

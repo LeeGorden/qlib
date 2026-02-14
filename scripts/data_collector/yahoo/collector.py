@@ -539,6 +539,8 @@ class YahooNormalize1dExtend(YahooNormalize1d):
         symbol_name = df[self._symbol_field_name].iloc[0]
         old_symbol_list = self.old_qlib_data.index.get_level_values("instrument").unique().to_list()
         if str(symbol_name).upper() not in old_symbol_list:
+            # MODIFIED: new stock — log and use standard normalize result
+            logger.info(f"New symbol {symbol_name} not in old data, using standard normalize")
             return df.reset_index()
         old_df = self.old_qlib_data.loc[str(symbol_name).upper()]
         latest_date = old_df.index[-1]
