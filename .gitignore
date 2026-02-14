@@ -51,3 +51,6 @@ tags
 ./pretrain
 .idea/
 .aider*
+
+# MODIFIED: qlib data directory (large binary files, do not track)
+qlib_data/
