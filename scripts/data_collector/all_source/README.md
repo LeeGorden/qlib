@@ -55,7 +55,7 @@ pip install -r requirements.txt
 ### Collector *YahooFinance* data to qlib
 > collector *YahooFinance* data and *dump* into `qlib` format.
 > If the above ready-made data can't meet users' requirements,  users can follow this section to crawl the latest data and convert it to qlib-data.
-  1. download data to csv: `python scripts/data_collector/yahoo/collector.py download_data`
+  1. download data to csv: `python scripts/data_collector/all_source/collector.py download_data`
      
      This will download the raw data such as high, low, open, close, adjclose price from yahoo to a local directory. One file per symbol.
 
@@ -93,7 +93,7 @@ pip install -r requirements.txt
           # br 1min data
           python collector.py download_data --source_dir ~/.qlib/stock_data/source/br_data_1min --delay 1 --interval 1min --region BR
           ```
-  2. normalize data: `python scripts/data_collector/yahoo/collector.py normalize_data`
+  2. normalize data: `python scripts/data_collector/all_source/collector.py normalize_data`
      
      This will:
      1. Normalize high, low, close, open price using adjclose.
@@ -115,7 +115,7 @@ pip install -r requirements.txt
         
                 qlib_data_1d can be obtained like this:
                     $ python scripts/get_data.py qlib_data --target_dir <qlib_data_1d_dir> --interval 1d
-                    $ python scripts/data_collector/yahoo/collector.py update_data_to_bin --qlib_data_1d_dir <qlib_data_1d_dir> --end_date <end_date>
+                    $ python scripts/data_collector/all_source/collector.py update_data_to_bin --qlib_data_1d_dir <qlib_data_1d_dir> --end_date <end_date>
                 or:
                     download 1d data from YahooFinance
             
@@ -129,7 +129,7 @@ pip install -r requirements.txt
         python collector.py normalize_data --qlib_data_1d_dir ~/.qlib/qlib_data/cn_data --source_dir ~/.qlib/stock_data/source/cn_data_1min --normalize_dir ~/.qlib/stock_data/source/cn_1min_nor --region CN --interval 1min
 
         # normalize 1d br
-        python scripts/data_collector/yahoo/collector.py normalize_data --source_dir ~/.qlib/stock_data/source/br_data --normalize_dir ~/.qlib/stock_data/source/br_1d_nor --region BR --interval 1d
+        python scripts/data_collector/all_source/collector.py normalize_data --source_dir ~/.qlib/stock_data/source/br_data --normalize_dir ~/.qlib/stock_data/source/br_1d_nor --region BR --interval 1d
 
         # normalize 1min br
         python collector.py normalize_data --qlib_data_1d_dir ~/.qlib/qlib_data/br_data --source_dir ~/.qlib/stock_data/source/br_data_1min --normalize_dir ~/.qlib/stock_data/source/br_1min_nor --region BR --interval 1min
@@ -161,7 +161,7 @@ pip install -r requirements.txt
 ### Automatic update of daily frequency data(from yahoo finance)
   > It is recommended that users update the data manually once (--trading_date 2021-05-25) and then set it to update automatically.
   >
-  > **NOTE**: Users can't incrementally  update data based on the offline data provided by Qlib(some fields are removed to reduce the data size). Users should use [yahoo collector](https://github.com/microsoft/qlib/tree/main/scripts/data_collector/yahoo#automatic-update-of-daily-frequency-datafrom-yahoo-finance) to download Yahoo data from scratch and then incrementally update it.
+  > **NOTE**: Users can't incrementally  update data based on the offline data provided by Qlib(some fields are removed to reduce the data size). Users should use [yahoo collector](https://github.com/microsoft/qlib/tree/main/scripts/data_collector/all_source#automatic-update-of-daily-frequency-datafrom-yahoo-finance) to download Yahoo data from scratch and then incrementally update it.
   > 
 
   * Automatic update of data to the "qlib" directory each trading day(Linux)
@@ -171,17 +171,17 @@ pip install -r requirements.txt
         ```
         * * * * 1-5 python <script path> update_data_to_bin --qlib_data_1d_dir <user data dir>
         ```
-        * **script path**: *scripts/data_collector/yahoo/collector.py*
+        * **script path**: *scripts/data_collector/all_source/collector.py*
 
   * Manual update of data
       ```
-      python scripts/data_collector/yahoo/collector.py update_data_to_bin --qlib_data_1d_dir <user data dir> --end_date <end date>
+      python scripts/data_collector/all_source/collector.py update_data_to_bin --qlib_data_1d_dir <user data dir> --end_date <end date>
       ```
       * `end_date`: end of trading day(not included)
       * `check_data_length`: check the number of rows per *symbol*, by default `None`
         > if `len(symbol_df) < check_data_length`, it will be re-fetched, with the number of re-fetches coming from the `max_collector_count` parameter
 
-  * `scripts/data_collector/yahoo/collector.py update_data_to_bin` parameters:
+  * `scripts/data_collector/all_source/collector.py update_data_to_bin` parameters:
       * `source_dir`: The directory where the raw data collected from the Internet is saved, default "Path(__file__).parent/source"
       * `normalize_dir`: Directory for normalize data, default "Path(__file__).parent/normalize"
       * `qlib_data_1d_dir`: the qlib data to be updated for yahoo, usually from: [download qlib data](https://github.com/microsoft/qlib/tree/main/scripts#download-cn-data)
@@ -223,3 +223,53 @@ pip install -r requirements.txt
   # df = D.features(D.instruments("all"), ["$close"], freq="1min")
   ```
 
+---
+
+## Development Log
+
+### Folder Rename: `yahoo` → `all_source`
+Data sources are no longer Yahoo-only. Renamed `data_collector/yahoo/` to `data_collector/all_source/`. All internal/external references updated.
+
+### Multi-Source Price Data (Yahoo → Stooq → Nasdaq Data Link)
+- **`collector.py`**: Added `get_data_from_stooq()` and `get_data_from_nasdaq_data_link()` as fallbacks in `get_data()`.
+- **`update_qlib_data.py`**: Added `_fetch_stock_data_multi_source()` — centralized Yahoo → Stooq → NDL fallback used by all download phases and `update_single_stock.py`.
+- Requires `nasdaq-data-link` package (optional; WIKI dataset, data up to ~2018-03). API key via `NASDAQ_DATA_LINK_API_KEY` env var.
+
+### Full Market Update (`update_qlib_data.py`)
+New script for end-to-end market updates. Usage:
+```bash
+python scripts/update_qlib_data.py --qlib_data_1d_dir <path> --end_date 2026-02-13 --region US --delay 0.75
+```
+**Phases:**
+1. **Phase 1a** — Batch download existing stocks (start = 5th-percentile `end_datetime`, not min, to avoid outlier drag).
+2. **Phase 1b** — Supplement download for missed/stale stocks (individual Yahoo → Stooq → NDL).
+3. **Phase 1c** — Normalize → dump to bin.
+4. **Phase 2** — Detect new stocks (online symbols − existing symbols), download → normalize → dump.
+5. **Reconcile** — `_reconcile_instruments_from_bin()` rebuilds `instruments/all.txt` from actual `.bin` file data (ground truth).
+
+### Resume Capability
+- `_get_uptodate_symbols()`: skips stocks already up-to-date in bin files.
+- Existing source CSVs are reused (not re-downloaded).
+- `_clear_csv_dir()` runs only **after** successful dump, not before.
+
+### Rate Limit Handling
+- **`utils.py`**: Added `RateLimitError`; `deco_retry` propagates it immediately (no retry).
+- **`collector.py`**: Detects rate-limit keywords in Yahoo responses → raises `RateLimitError`.
+- **`update_qlib_data.py`**: Rate limit or consecutive failures → sets flag, **breaks download loop but still runs normalize → dump → reconcile** on successfully downloaded data. Ensures `all.txt` is always updated with available data.
+
+### Date Format Fix
+- **`_clean_csv_dates`**: Uses `format="mixed", utc=True` to handle mixed date formats (e.g., `2024-01-15 09:30:00-05:00`).
+- **`normalize_yahoo`**: Uses `format="mixed", utc=True` + `tz_convert(None)` instead of `tz_localize(None)`.
+
+### Stock Symbol Sources
+- **Online**: NASDAQ FTP, NYSE API, Eastmoney API (graceful skip on failure).
+- **Local**: Merges symbols from existing `all.txt` into the online list — ensures previously tracked stocks are never lost.
+
+### Files Changed
+| File | Changes |
+|------|---------|
+| `scripts/update_qlib_data.py` | New full-market-update script with phases, resume, rate-limit handling, reconciliation |
+| `scripts/update_single_stock.py` | Uses `_fetch_stock_data_multi_source` and `all_source` path |
+| `scripts/data_collector/all_source/collector.py` | Stooq/NDL fallbacks, rate-limit detection, mixed date format fix |
+| `scripts/data_collector/utils.py` | `RateLimitError`, `deco_retry` fix, `get_us_stock_symbols` merges `all.txt` |
+| `scripts/data_collector/base.py` | No logic change (normalize failure is a warning, not fatal) |

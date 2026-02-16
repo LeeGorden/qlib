@@ -23,6 +23,15 @@ from bs4 import BeautifulSoup
 
 HS_SYMBOLS_URL = "http://app.finance.ifeng.com/hq/list.php?type=stock_a&class={s_type}"
 
+
+class RateLimitError(Exception):
+    """Raised when a data source returns a rate-limit / HTTP 429 response.
+
+    This exception is NOT retried by ``deco_retry`` and propagates
+    immediately so the caller can decide to stop gracefully.
+    """
+    pass
+
 CALENDAR_URL_BASE = "http://push2his.eastmoney.com/api/qt/stock/kline/get?secid={market}.{bench_code}&fields1=f1%2Cf2%2Cf3%2Cf4%2Cf5&fields2=f51%2Cf52%2Cf53%2Cf54%2Cf55%2Cf56%2Cf57%2Cf58&klt=101&fqt=0&beg=19900101&end=20991231"
 SZSE_CALENDAR_URL = "http://www.szse.cn/api/report/exchange/onepersistenthour/monthList?month={month}&random={random}"
 
@@ -351,14 +360,33 @@ def get_us_stock_symbols(qlib_data_path: [str, Path] = None) -> list:
         if not _all_symbols:
             logger.error("All US stock symbol sources failed, returning empty list")
             return []
+        # Also include symbols already in all.txt so we never lose existing stocks.
+        # (Previously tried to read nasdaq100.txt/sp500.txt which may not exist.)
         if qlib_data_path is not None:
+            _all_txt = Path(qlib_data_path).joinpath("instruments/all.txt")
+            if _all_txt.exists():
+                try:
+                    _existing_df = pd.read_csv(
+                        _all_txt, sep="\t",
+                        names=["symbol", "start_date", "end_date"],
+                        dtype={"symbol": str},
+                    )
+                    _all_symbols += _existing_df["symbol"].dropna().unique().tolist()
+                    logger.info(f"Added {len(_existing_df)} existing symbols from all.txt")
+                except Exception as e:
+                    logger.warning(f"Failed to read all.txt: {e}")
+            # Also try index files if they happen to exist
             for _index in ["nasdaq100", "sp500"]:
-                ins_df = pd.read_csv(
-                    Path(qlib_data_path).joinpath(f"instruments/{_index}.txt"),
-                    sep="\t",
-                    names=["symbol", "start_date", "end_date"],
-                )
-                _all_symbols += ins_df["symbol"].unique().tolist()
+                _idx_path = Path(qlib_data_path).joinpath(f"instruments/{_index}.txt")
+                if _idx_path.exists():
+                    try:
+                        ins_df = pd.read_csv(
+                            _idx_path, sep="\t",
+                            names=["symbol", "start_date", "end_date"],
+                        )
+                        _all_symbols += ins_df["symbol"].unique().tolist()
+                    except Exception as e:
+                        logger.warning(f"Failed to read {_index}.txt: {e}")
 
         def _format(s_):
             s_ = s_.replace(".", "-")
@@ -547,6 +575,9 @@ def deco_retry(retry: int = 5, retry_sleep: int = 3):
                 try:
                     _result = func(*args, **kwargs)
                     break
+
+                except RateLimitError:
+                    raise  # Never retry on rate-limit — propagate immediately
 
                 except Exception as e:
                     logger.warning(f"{func.__name__}: {_i} :{e}")

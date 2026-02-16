@@ -4,7 +4,7 @@
 
 Scripts for data collection
 
-- yahoo: get *US/CN* stock data from *Yahoo Finance*
+- all_source: get *US/CN* stock data from multiple sources (*Yahoo Finance*, *Stooq*, etc.)
 - fund: get fund data from *http://fund.eastmoney.com*
 - cn_index: get *CN index* from *http://www.csindex.com.cn*, *CSI300*/*CSI100*
 - us_index: get *US index* from *https://en.wikipedia.org/wiki*, *SP500*/*NASDAQ100*/*DJIA*/*SP400*
@@ -13,7 +13,7 @@ Scripts for data collection
 
 ## Custom Data Collection
 
-> Specific implementation reference: https://github.com/microsoft/qlib/tree/main/scripts/data_collector/yahoo
+> Specific implementation reference: https://github.com/microsoft/qlib/tree/main/scripts/data_collector/all_source
 
 1. Create a dataset code directory in the current directory
 2. Add `collector.py`

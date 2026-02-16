@@ -85,7 +85,7 @@ Automatic update of daily frequency data
 
   **It is recommended that users update the data manually once (\-\-trading_date 2021-05-25) and then set it to update automatically.**
 
-  For more information refer to: `yahoo collector <https://github.com/microsoft/qlib/tree/main/scripts/data_collector/yahoo#Automatic-update-of-daily-frequency-data>`_
+  For more information refer to: `yahoo collector <https://github.com/microsoft/qlib/tree/main/scripts/data_collector/all_source#Automatic-update-of-daily-frequency-data>`_
 
   - Automatic update of data to the "qlib" directory each trading day(Linux)
       - use *crontab*: `crontab -e`
@@ -95,13 +95,13 @@ Automatic update of daily frequency data
 
             * * * * 1-5 python <script path> update_data_to_bin --qlib_data_1d_dir <user data dir>
 
-        - **script path**: *scripts/data_collector/yahoo/collector.py*
+        - **script path**: *scripts/data_collector/all_source/collector.py*
 
   - Manual update of data
 
       .. code-block:: bash
 
-        python scripts/data_collector/yahoo/collector.py update_data_to_bin --qlib_data_1d_dir <user data dir> --trading_date <start date> --end_date <end date>
+        python scripts/data_collector/all_source/collector.py update_data_to_bin --qlib_data_1d_dir <user data dir> --trading_date <start date> --end_date <end date>
 
       - *trading_date*: start of trading day
       - *end_date*: end of trading day(not included)
@@ -124,7 +124,7 @@ for daily data:
 for 1min data:
   .. code-block:: bash
 
-    python scripts/data_collector/yahoo/collector.py download_data --source_dir ~/.qlib/stock_data/source/cn_1min --region CN --start 2021-05-20 --end 2021-05-23 --delay 0.1 --interval 1min --limit_nums 10
+    python scripts/data_collector/all_source/collector.py download_data --source_dir ~/.qlib/stock_data/source/cn_1min --region CN --start 2021-05-20 --end 2021-05-23 --delay 0.1 --interval 1min --limit_nums 10
 
 Users can also provide their own data in CSV or Parquet format. However, the data **must satisfies** following criterions:
 

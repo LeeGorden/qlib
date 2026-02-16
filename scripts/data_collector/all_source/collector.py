@@ -33,6 +33,7 @@ from dump_bin import DumpDataUpdate
 from data_collector.base import BaseCollector, BaseNormalize, BaseRun, Normalize
 from data_collector.utils import (
     deco_retry,
+    RateLimitError,
     get_calendar_list,
     get_hs_stock_symbols,
     get_us_stock_symbols,
@@ -122,6 +123,9 @@ class YahooCollector(BaseCollector):
     def _timezone(self):
         raise NotImplementedError("rewrite get_timezone")
 
+    # Keywords that indicate a rate-limit / throttle response from Yahoo
+    _RATE_LIMIT_KEYWORDS = ["too many requests", "rate limit", "429", "throttled"]
+
     @staticmethod
     def get_data_from_remote(symbol, interval, start, end, show_1min_logging: bool = False):
         error_msg = f"{symbol}-{interval}-{start}-{end}"
@@ -137,17 +141,132 @@ class YahooCollector(BaseCollector):
                 return _resp.reset_index()
             elif isinstance(_resp, dict):
                 _temp_data = _resp.get(symbol, {})
-                if isinstance(_temp_data, str) or (
-                    isinstance(_resp, dict) and _temp_data.get("indicators", {}).get("quote", None) is None
-                ):
+                if isinstance(_temp_data, str):
+                    # Check for rate-limit indicators in the error string
+                    _lower = _temp_data.lower()
+                    if any(kw in _lower for kw in YahooCollector._RATE_LIMIT_KEYWORDS):
+                        raise RateLimitError(
+                            f"Yahoo Finance rate limit detected for {symbol}: {_temp_data}"
+                        )
+                    _show_logging_func()
+                elif isinstance(_resp, dict) and _temp_data.get("indicators", {}).get("quote", None) is None:
                     _show_logging_func()
             else:
                 _show_logging_func()
+        except RateLimitError:
+            raise  # Always propagate rate-limit errors
         except Exception as e:
+            _err_str = str(e).lower()
+            if any(kw in _err_str for kw in YahooCollector._RATE_LIMIT_KEYWORDS):
+                raise RateLimitError(
+                    f"Yahoo Finance rate limit detected for {symbol}: {e}"
+                )
             logger.warning(
                 f"get data error: {symbol}--{start}--{end}"
                 + "Your data request fails. This may be caused by your firewall (e.g. GFW). Please switch your network if you want to access Yahoo! data"
             )
+
+    @staticmethod
+    def get_data_from_stooq(symbol: str, start, end) -> pd.DataFrame:
+        """Fallback: fetch daily OHLCV from Stooq.com when Yahoo fails.
+
+        Stooq symbol format: append '.US' for US stocks, e.g. AAPL → AAPL.US
+        Returns DataFrame with columns: date, open, high, low, close, volume
+        or None on failure.
+        """
+        import requests as _req
+        from io import StringIO
+
+        # Build Stooq symbol: replace _ with -, append .US
+        stooq_sym = symbol.replace("_", "-").upper() + ".US"
+        start_fmt = pd.Timestamp(start).strftime("%Y%m%d")
+        end_fmt = pd.Timestamp(end).strftime("%Y%m%d")
+        url = f"https://stooq.com/q/d/l/?s={stooq_sym}&d1={start_fmt}&d2={end_fmt}&i=d"
+
+        try:
+            resp = _req.get(url, timeout=30)
+            if resp.status_code != 200:
+                return None
+            df = pd.read_csv(StringIO(resp.text))
+            if df.empty or "Date" not in df.columns:
+                return None
+            df.columns = [c.lower() for c in df.columns]
+            df = df.rename(columns={"date": "date"})
+            df["adjclose"] = df["close"]  # Stooq data is already adjusted
+            df["symbol"] = symbol
+            df = df.sort_values("date").reset_index(drop=True)
+            return df
+        except Exception:
+            return None
+
+    @staticmethod
+    def get_data_from_nasdaq_data_link(symbol: str, start, end) -> pd.DataFrame:
+        """Fallback #2: fetch daily OHLCV from Nasdaq Data Link (formerly Quandl).
+
+        Uses the free WIKI/PRICES dataset (data available up to ~March 2018).
+        Requires the ``nasdaq-data-link`` package.  An API key can be provided
+        via the environment variable ``NASDAQ_DATA_LINK_API_KEY`` (optional for
+        limited free-tier calls, recommended for higher quota).
+
+        Parameters
+        ----------
+        symbol : str
+            Stock ticker in fname format (e.g. "AAPL", "BRK_B").
+        start, end :
+            Date range (anything ``pd.Timestamp`` can parse).
+
+        Returns
+        -------
+        pd.DataFrame or None
+            DataFrame with columns: date, open, high, low, close, volume,
+            adjclose, symbol — or None on failure.
+        """
+        try:
+            import nasdaqdatalink
+        except ImportError:
+            logger.debug("[NDL] nasdaq-data-link package not installed — skipping.")
+            return None
+
+        import os
+
+        api_key = os.environ.get("NASDAQ_DATA_LINK_API_KEY", "")
+        if api_key:
+            nasdaqdatalink.ApiConfig.api_key = api_key
+
+        # NDL WIKI dataset uses dot-separated tickers (BRK.B not BRK_B/BRK-B)
+        ndl_symbol = symbol.replace("_", ".").replace("-", ".").upper()
+
+        start_str = pd.Timestamp(start).strftime("%Y-%m-%d")
+        end_str = pd.Timestamp(end).strftime("%Y-%m-%d")
+
+        try:
+            df = nasdaqdatalink.get(
+                f"WIKI/{ndl_symbol}",
+                start_date=start_str,
+                end_date=end_str,
+            )
+            if df is None or df.empty:
+                return None
+
+            # WIKI returns DatetimeIndex; reset to column
+            df = df.reset_index()
+            # Lowercase all column names: 'Date', 'Open', ..., 'Adj. Close', ...
+            df.columns = [c.lower() for c in df.columns]
+            df = df.rename(columns={"adj. close": "adjclose"})
+
+            if "adjclose" not in df.columns and "close" in df.columns:
+                df["adjclose"] = df["close"]
+            df["symbol"] = symbol
+
+            keep_cols = ["date", "open", "high", "low", "close", "volume", "adjclose", "symbol"]
+            df = df[[c for c in keep_cols if c in df.columns]]
+            df = df.sort_values("date").reset_index(drop=True)
+
+            logger.info(f"[NDL fallback] Got {len(df)} rows for {symbol} from WIKI dataset")
+            return df
+        except Exception as e:
+            logger.debug(f"[NDL] WIKI/{ndl_symbol} failed: {e}")
+            return None
 
     def get_data(
         self, symbol: str, interval: str, start_datetime: pd.Timestamp, end_datetime: pd.Timestamp
@@ -172,8 +291,30 @@ class YahooCollector(BaseCollector):
         if interval == self.INTERVAL_1d:
             try:
                 _result = _get_simple(start_datetime, end_datetime)
+            except RateLimitError:
+                raise  # Propagate rate-limit immediately — do NOT fall through to Stooq
             except ValueError as e:
                 pass
+
+            # --- Stooq fallback for daily data ---
+            if _result is None or _result.empty:
+                try:
+                    _stooq_df = self.get_data_from_stooq(symbol, start_datetime, end_datetime)
+                    if _stooq_df is not None and not _stooq_df.empty:
+                        logger.info(f"[Stooq fallback] Got {len(_stooq_df)} rows for {symbol}")
+                        _result = _stooq_df
+                except Exception:
+                    pass
+
+            # --- Nasdaq Data Link fallback for daily data ---
+            if _result is None or _result.empty:
+                try:
+                    _ndl_df = self.get_data_from_nasdaq_data_link(symbol, start_datetime, end_datetime)
+                    if _ndl_df is not None and not _ndl_df.empty:
+                        _result = _ndl_df
+                except Exception:
+                    pass
+
         elif interval == self.INTERVAL_1min:
             _res = []
             _start = self.start_datetime
@@ -392,8 +533,8 @@ class YahooNormalize(BaseNormalize):
         columns = copy.deepcopy(YahooNormalize.COLUMNS)
         df = df.copy()
         df.set_index(date_field_name, inplace=True)
-        df.index = pd.to_datetime(df.index)
-        df.index = df.index.tz_localize(None)
+        df.index = pd.to_datetime(df.index, format="mixed", utc=True)
+        df.index = df.index.tz_convert(None)
         df = df[~df.index.duplicated(keep="first")]
         if calendar_list is not None:
             df = df.reindex(
@@ -539,20 +680,27 @@ class YahooNormalize1dExtend(YahooNormalize1d):
         symbol_name = df[self._symbol_field_name].iloc[0]
         old_symbol_list = self.old_qlib_data.index.get_level_values("instrument").unique().to_list()
         if str(symbol_name).upper() not in old_symbol_list:
-            # MODIFIED: new stock — log and use standard normalize result
+            # new stock — use standard normalize result
             logger.info(f"New symbol {symbol_name} not in old data, using standard normalize")
             return df.reset_index()
         old_df = self.old_qlib_data.loc[str(symbol_name).upper()]
         latest_date = old_df.index[-1]
         df = df.loc[latest_date:]
+        if df.empty:
+            return df.reset_index()
         new_latest_data = df.iloc[0]
         old_latest_data = old_df.loc[latest_date]
         for col in self.column_list[:-1]:
+            old_val = old_latest_data.get(col, np.nan) if isinstance(old_latest_data, pd.Series) else old_latest_data
+            new_val = new_latest_data.get(col, np.nan) if isinstance(new_latest_data, pd.Series) else new_latest_data
+            if pd.isna(old_val) or pd.isna(new_val) or new_val == 0:
+                continue
             if col == "volume":
-                df[col] = df[col] / (new_latest_data[col] / old_latest_data[col])
+                df[col] = df[col] / (new_val / old_val)
             else:
-                df[col] = df[col] * (old_latest_data[col] / new_latest_data[col])
-        return df.drop(df.index[0]).reset_index()
+                df[col] = df[col] * (old_val / new_val)
+        result = df.iloc[1:] if len(df) > 1 else df.iloc[0:0]
+        return result.reset_index()
 
 
 class YahooNormalize1min(YahooNormalize, ABC):
@@ -821,7 +969,7 @@ class Run(BaseRun):
 
                 qlib_data_1d can be obtained like this:
                     $ python scripts/get_data.py qlib_data --target_dir <qlib_data_1d_dir> --interval 1d
-                    $ python scripts/data_collector/yahoo/collector.py update_data_to_bin --qlib_data_1d_dir <qlib_data_1d_dir> --trading_date 2021-06-01
+                    $ python scripts/data_collector/all_source/collector.py update_data_to_bin --qlib_data_1d_dir <qlib_data_1d_dir> --trading_date 2021-06-01
                 or:
                     download 1d data, reference: https://github.com/microsoft/qlib/tree/main/scripts/data_collector/yahoo#1d-from-yahoo
 
@@ -852,7 +1000,7 @@ class Run(BaseRun):
 
                 2. collector source data: https://github.com/microsoft/qlib/tree/main/scripts/data_collector/yahoo#collector-data; save to <dir2>
 
-                3. normalize new source data(from step 2): python scripts/data_collector/yahoo/collector.py normalize_data_1d_extend --old_qlib_dir <dir1> --source_dir <dir2> --normalize_dir <dir3> --region CN --interval 1d
+                3. normalize new source data(from step 2): python scripts/data_collector/all_source/collector.py normalize_data_1d_extend --old_qlib_dir <dir1> --source_dir <dir2> --normalize_dir <dir3> --region CN --interval 1d
 
                 4. dump data: python scripts/dump_bin.py dump_update --data_path <dir3> --qlib_dir <dir1> --freq day --date_field_name date --symbol_field_name symbol --exclude_fields symbol,date
 

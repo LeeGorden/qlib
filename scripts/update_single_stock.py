@@ -5,11 +5,11 @@
 """
 Update a single stock's data in the qlib data directory.
 
-Usage (run from quant_finance/qlib/scripts/data_collector/yahoo/):
+Usage (run from quant_finance/qlib/scripts/data_collector/all_source/):
     python ../../../scripts/update_single_stock.py --symbol AAPL --qlib_data_1d_dir ~/.qlib/qlib_data/us_data --end_date 2026-02-14 --region US
 
 Or from quant_finance/qlib/scripts/:
-    cd data_collector/yahoo
+    cd data_collector/all_source
     python ../../update_single_stock.py --symbol AAPL --qlib_data_1d_dir ~/.qlib/qlib_data/us_data
 """
 
@@ -30,9 +30,9 @@ from loguru import logger
 
 # Setup path so that data_collector imports work
 SCRIPT_DIR = Path(__file__).resolve().parent
-YAHOO_DIR = SCRIPT_DIR / "data_collector" / "yahoo"
+ALL_SOURCE_DIR = SCRIPT_DIR / "data_collector" / "all_source"
 sys.path.insert(0, str(SCRIPT_DIR))
-sys.path.insert(0, str(YAHOO_DIR))
+sys.path.insert(0, str(ALL_SOURCE_DIR))
 
 import qlib
 from qlib.utils import exists_qlib_data, fname_to_code, code_to_fname
@@ -217,16 +217,17 @@ def update_single_stock(
         logger.info(f"{symbol_upper} is already up to date (start={start_date} >= end={end_date})")
         return
 
-    # === Step 1: Download raw data from Yahoo ===
-    logger.info(f"Step 1: Downloading {symbol} data from Yahoo ({start_date} ~ {end_date})...")
+    # === Step 1: Download raw data (Yahoo → Stooq fallback) ===
+    logger.info(f"Step 1: Downloading {symbol} data ({start_date} ~ {end_date})...")
 
-    # Import Yahoo collector components (must be after sys.path setup)
-    from collector import YahooCollector
+    from update_qlib_data import _fetch_stock_data_multi_source
 
     try:
-        raw_df = YahooCollector.get_data_from_remote(
-            symbol=symbol, interval="1d",
-            start=start_date, end=end_date,
+        raw_df = _fetch_stock_data_multi_source(
+            symbol_yahoo=symbol,
+            symbol_fname=symbol_fname,
+            start=start_date,
+            end=end_date,
         )
     except Exception as e:
         failure_logger.log(symbol, start_date, end_date, "network_error", str(e))
@@ -236,15 +237,20 @@ def update_single_stock(
     if raw_df is None or raw_df.empty:
         failure_logger.log(
             symbol, start_date, end_date, "empty_data",
-            "All sources returned no data — possibly delisted"
+            "Yahoo + Stooq both returned no data — possibly delisted"
         )
         failure_logger.save()
         return
 
-    logger.info(f"Downloaded {len(raw_df)} rows for {symbol}")
+    # Report source
+    data_source = "unknown"
+    if "_source" in raw_df.columns:
+        data_source = raw_df["_source"].iloc[0]
+        raw_df = raw_df.drop(columns=["_source"])
+    logger.info(f"Downloaded {len(raw_df)} rows for {symbol} (source: {data_source})")
 
     # === Step 2: Save raw CSV ===
-    source_dir = YAHOO_DIR / "source_single"
+    source_dir = ALL_SOURCE_DIR / "source_single"
     source_dir.mkdir(parents=True, exist_ok=True)
 
     raw_df["symbol"] = symbol_fname
@@ -254,7 +260,7 @@ def update_single_stock(
 
     # === Step 3: Normalize ===
     logger.info(f"Step 2: Normalizing data...")
-    normalize_dir = YAHOO_DIR / "normalize_single"
+    normalize_dir = ALL_SOURCE_DIR / "normalize_single"
     normalize_dir.mkdir(parents=True, exist_ok=True)
 
     is_new_stock = not (existing_mask.any() and feature_dir.exists())
