@@ -25,10 +25,7 @@ import importlib
 import traceback
 import multiprocessing
 from pathlib import Path
-from typing import Optional, List
-
-import shutil
-import tempfile
+from typing import Optional
 
 import fire
 import numpy as np
@@ -135,73 +132,24 @@ def _clear_csv_dir(dir_path: Path):
             pass
 
 
-def _get_uptodate_symbols(qlib_data_dir: str, end_date: str, tolerance_days: int = 5) -> set:
-    """Scan bin files to find symbols whose data is already up-to-date.
+def _get_csv_last_date(csv_path: Path) -> Optional[str]:
+    """Read the last date from a source CSV file.
 
-    A stock is considered "up-to-date" if its bin data ends within
-    ``tolerance_days`` of ``end_date``.  This allows us to skip
-    re-downloading stocks that were already successfully updated in a
-    previous (possibly interrupted) run.
-
-    Parameters
-    ----------
-    qlib_data_dir : str
-        Path to the qlib data directory (e.g. us_data)
-    end_date : str
-        Target end date for the update
-    tolerance_days : int
-        Number of trading days tolerance for "up-to-date" check.
-        Default 5 (≈ 1 trading week) to account for weekends/holidays.
-
-    Returns
-    -------
-    set
-        Uppercase fname-format symbols that are already up-to-date.
+    Returns the latest date string (YYYY-MM-DD) in the CSV, or None if
+    the file is empty / unreadable.
     """
-    qlib_data_dir = Path(qlib_data_dir)
-    calendar_path = qlib_data_dir / "calendars" / "day.txt"
-    features_dir = qlib_data_dir / "features"
-
-    if not calendar_path.exists() or not features_dir.exists():
-        return set()
-
-    calendar_df = pd.read_csv(calendar_path, header=None)
-    calendar_list = sorted(pd.to_datetime(calendar_df[0]).tolist())
-    cal_len = len(calendar_list)
-    if cal_len == 0:
-        return set()
-
-    target_ts = pd.Timestamp(end_date)
-    # Find the calendar date that is tolerance_days before end_date
-    threshold_ts = target_ts - pd.Timedelta(days=tolerance_days + 2)  # +2 for weekends
-
-    uptodate = set()
-    for stock_dir in features_dir.iterdir():
-        if not stock_dir.is_dir():
-            continue
-        bin_file = stock_dir / "close.day.bin"
-        if not bin_file.exists():
-            bin_files = list(stock_dir.glob("*.day.bin"))
-            if not bin_files:
-                continue
-            bin_file = bin_files[0]
-        try:
-            data = np.fromfile(str(bin_file), dtype="<f")
-            if len(data) < 2:
-                continue
-            start_index = int(data[0])
-            num_data = len(data) - 1
-            end_index = start_index + num_data - 1
-            if end_index < 0 or end_index >= cal_len:
-                continue
-            bin_end_date = calendar_list[end_index]
-            if bin_end_date >= threshold_ts:
-                sym = fname_to_code(stock_dir.name).upper()
-                uptodate.add(sym)
-        except Exception:
-            continue
-
-    return uptodate
+    try:
+        df = pd.read_csv(csv_path, usecols=["date"], dtype=str)
+        if df.empty:
+            return None
+        dates = pd.to_datetime(df["date"], format="mixed", utc=True, errors="coerce")
+        if dates.isna().all():
+            dates = pd.to_datetime(df["date"], format="mixed", errors="coerce")
+        if dates.isna().all():
+            return None
+        return dates.max().strftime("%Y-%m-%d")
+    except Exception:
+        return None
 
 
 # =====================================================================
@@ -372,155 +320,6 @@ def _reconcile_instruments_from_bin(qlib_data_dir: str) -> pd.DataFrame:
     return pd.DataFrame()
 
 
-def _download_supplement_stocks(
-    missed_symbols: set,
-    source_dir: Path,
-    download_start: str,
-    end_date: str,
-    delay: float,
-    failure_logger: FailureLogger,
-    per_stock_start: dict = None,
-):
-    """Download data for existing stocks that the batch download missed.
-
-    These are typically ETFs, SPACs, or stocks on exchanges not covered by
-    get_us_stock_symbols(). We download them individually using Yahoo API.
-
-    NOTE: We always use ``end_date`` (the global target date) as the download
-    end for every stock.  We do NOT try to pre-cap the end date for "likely
-    delisted" stocks because ``end_datetime`` in all.txt only tells us
-    "last date we have data for", NOT "actual delisting date".  Almost every
-    stock that needs updating will satisfy ``end_datetime < end_date``.
-    Yahoo / Stooq handle delisted stocks gracefully — they return data up to
-    the actual last trading day or return empty.  After downloading,
-    ``_reconcile_instruments_from_bin()`` rebuilds all.txt from the real bin
-    data, so ``end_datetime`` will reflect the true data range.
-
-    Parameters
-    ----------
-    missed_symbols : set
-        Set of uppercase fname-format symbols to download
-    source_dir : Path
-        Directory to save CSV files (same as Phase 1 source_dir)
-    download_start : str
-        Default start date for download
-    end_date : str
-        End date for download (always the global target date)
-    delay : float
-        Delay between requests
-    failure_logger : FailureLogger
-        Logger for failures
-    per_stock_start : dict, optional
-        Mapping of symbol → custom start date for stale outlier stocks
-        whose end_datetime is earlier than the batch download_start
-
-    Raises
-    ------
-    RateLimitError
-        If Yahoo responds with a rate-limit signal or too many consecutive
-        failures are detected.  The caller should catch this and stop.
-    """
-    from data_collector.utils import RateLimitError
-
-    MAX_CONSECUTIVE_FAILURES = 15  # likely rate-limited if this many fail in a row
-
-    if per_stock_start is None:
-        per_stock_start = {}
-
-    total = len(missed_symbols)
-    success = 0
-    skipped = 0
-    stooq_hits = 0
-    consecutive_failures = 0
-    logger.info(f"Supplementing {total} stocks (Yahoo → Stooq → NDL fallback)...")
-
-    for i, sym_fname in enumerate(sorted(missed_symbols), 1):
-        # Resume: skip if CSV already exists from a previous run
-        csv_path = source_dir / f"{sym_fname}.csv"
-        if csv_path.exists() and csv_path.stat().st_size > 100:
-            skipped += 1
-            continue
-
-        yahoo_symbol = fname_to_code(sym_fname.lower())
-        stock_start = per_stock_start.get(sym_fname, download_start)
-
-        # Skip if start >= end (no data range to download)
-        if pd.Timestamp(stock_start) >= pd.Timestamp(end_date):
-            logger.info(f"  Skipping {sym_fname}: start ({stock_start}) >= end ({end_date})")
-            continue
-
-        if i % 200 == 0 or i == total:
-            logger.info(
-                f"  Supplement progress: {i}/{total} "
-                f"({success} success, {stooq_hits} from Stooq)"
-            )
-
-        try:
-            time.sleep(delay)
-            raw_df = _fetch_stock_data_multi_source(
-                symbol_yahoo=yahoo_symbol,
-                symbol_fname=sym_fname,
-                start=stock_start,
-                end=end_date,
-            )
-
-            if raw_df is None or raw_df.empty:
-                consecutive_failures += 1
-                failure_logger.log(
-                    yahoo_symbol, stock_start, end_date, "empty_data",
-                    f"Supplement: Yahoo + Stooq + NDL all returned no data (requested {stock_start}~{end_date})"
-                )
-                if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
-                    logger.error(
-                        f"{consecutive_failures} consecutive empty results — likely rate-limited. "
-                        f"Stopping supplement download loop."
-                    )
-                    logger.info("Successfully downloaded data will still be normalized and dumped.")
-                    break  # Exit download loop but DON'T raise
-                continue
-
-            consecutive_failures = 0  # Reset on success
-
-            # Track which source provided the data
-            if "_source" in raw_df.columns:
-                if (raw_df["_source"] == "stooq").any():
-                    stooq_hits += 1
-                raw_df = raw_df.drop(columns=["_source"])
-
-            # Ensure 'date' is a column (not index) and 'symbol' is set
-            if "date" not in raw_df.columns and raw_df.index.name == "date":
-                raw_df = raw_df.reset_index()
-            raw_df["symbol"] = sym_fname
-
-            csv_path = source_dir / f"{sym_fname}.csv"
-            raw_df.to_csv(csv_path, index=False)
-            success += 1
-
-        except RateLimitError:
-            logger.error("RATE LIMIT detected during supplement download — stopping download loop.")
-            logger.info("Successfully downloaded data will still be normalized and dumped.")
-            break  # Exit download loop but DON'T raise — let caller normalize what we have
-
-        except Exception as e:
-            consecutive_failures += 1
-            failure_logger.log(
-                yahoo_symbol, stock_start, end_date, "supplement_error", str(e)
-            )
-            if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
-                logger.error(
-                    f"{consecutive_failures} consecutive failures — likely rate-limited. "
-                    f"Stopping supplement download loop."
-                )
-                logger.info("Successfully downloaded data will still be normalized and dumped.")
-                break  # Exit download loop but DON'T raise
-
-    logger.info(
-        f"Supplement download complete: {success}/{total} succeeded "
-        f"({stooq_hits} from Stooq fallback)"
-        + (f", {skipped} skipped (CSV cache)" if skipped else "")
-    )
-    return success
-
 
 def update_qlib_data(
     qlib_data_1d_dir: str = "~/.qlib/qlib_data/us_data",
@@ -532,31 +331,34 @@ def update_qlib_data(
     exists_skip: bool = False,
     fail_log: str = "./update_fail_log.csv",
 ):
-    """Full market incremental update for qlib data.
+    """Incremental market update for qlib data (two-step approach).
+
+    Step 1: Merge symbol lists (existing instruments + online sources).
+    Step 2: For each symbol, check source CSV last date, download only
+            incremental data, then normalize + dump.
 
     Parameters
     ----------
     qlib_data_1d_dir : str
         qlib data directory, default ~/.qlib/qlib_data/us_data
     end_date : str
-        End date (excluded), default today. e.g. 2026-02-14
+        End date (excluded), default today. e.g. 2026-03-07
     region : str
         Market region, default US
     delay : float
         Delay between requests in seconds, default 1
     max_workers : int
-        Max concurrent workers for download, default 1
+        Max concurrent workers for normalize, default 1
     check_data_length : int
-        Check data length per symbol, default None
+        (unused, kept for CLI compat)
     exists_skip : bool
-        Skip if qlib data already exists (for init), default False
+        (unused, kept for CLI compat)
     fail_log : str
         Path for failure log CSV, default ./update_fail_log.csv
     """
     qlib_data_1d_dir = str(Path(qlib_data_1d_dir).expanduser().resolve())
     failure_logger = FailureLogger(fail_log)
 
-    # Validate qlib data dir
     if not exists_qlib_data(qlib_data_1d_dir):
         logger.error(
             f"Qlib data directory not found or incomplete: {qlib_data_1d_dir}\n"
@@ -564,7 +366,6 @@ def update_qlib_data(
         )
         return
 
-    # Default end_date
     today_str = datetime.datetime.now().strftime("%Y-%m-%d")
     if end_date is None:
         end_date = today_str
@@ -572,209 +373,240 @@ def update_qlib_data(
         end_date = today_str
         logger.info(f"Clamped end_date to today: {end_date}")
 
-    logger.info(f"=== Full market update: region={region} ===")
+    logger.info(f"=== Incremental market update: region={region} ===")
     logger.info(f"qlib_data_1d_dir: {qlib_data_1d_dir}")
     logger.info(f"end_date: {end_date}")
-
-    # ----------------------------------------------------------
-    # Pre-check: snapshot existing symbols BEFORE any changes
-    # ----------------------------------------------------------
-    instruments_path = Path(qlib_data_1d_dir) / "instruments" / "all.txt"
-    original_existing_symbols = _get_existing_symbols(instruments_path)
-    logger.info(f"Original symbols in database: {len(original_existing_symbols)}")
-
-    # Determine download start for the batch download.
-    # Using the absolute minimum end_datetime is dangerous — one outlier stock
-    # (e.g. end=2012) would force downloading 13+ years for ALL 12k stocks.
-    # Instead we use the 5th-percentile end_datetime so the batch covers ~95%
-    # of stocks. Stocks below that threshold are handled individually in the
-    # supplement phase (Phase 1.5) with their own per-stock start dates.
-    inst_df = _read_instruments(instruments_path)
-    calendar_path = Path(qlib_data_1d_dir) / "calendars" / "day.txt"
-    calendar_df = pd.read_csv(calendar_path)
-    calendar_end = pd.Timestamp(calendar_df.iloc[-1, 0])
-
-    end_dates = pd.to_datetime(inst_df["end_datetime"])
-    p5_end = end_dates.quantile(0.05)          # 5th-percentile
-    earliest_end = end_dates.min()
-    batch_start_base = min(p5_end, calendar_end)
-    download_start = (batch_start_base - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
-
-    logger.info(f"Current calendar end: {calendar_end.strftime('%Y-%m-%d')}")
-    logger.info(f"Earliest instrument end_datetime: {earliest_end.strftime('%Y-%m-%d')}")
-    logger.info(f"5th-percentile end_datetime: {p5_end.strftime('%Y-%m-%d')}")
-    logger.info(f"Batch download start (with 1-day overlap): {download_start}")
-
-    # ========================================
-    # Phase 1: Batch download + supplement + normalize + dump
-    # ========================================
-    logger.info("=" * 60)
-    logger.info("Phase 1: Updating existing stocks")
-    logger.info("=" * 60)
 
     original_cwd = os.getcwd()
     os.chdir(str(ALL_SOURCE_DIR))
 
     try:
-        from collector import Run, YahooCollector
+        from collector import Run
+        from data_collector.utils import get_us_stock_symbols, RateLimitError
 
-        runner = Run(
-            source_dir=None,
-            normalize_dir=None,
-            max_workers=max_workers,
-            interval="1d",
-            region=region,
+        # ========================================================
+        # Step 1: Build complete symbol list (existing ∪ online)
+        # ========================================================
+        logger.info("=" * 60)
+        logger.info("Step 1: Building complete symbol list")
+        logger.info("=" * 60)
+
+        instruments_path = Path(qlib_data_1d_dir) / "instruments" / "all.txt"
+        existing_symbols = _get_existing_symbols(instruments_path)
+        logger.info(f"Existing symbols in database: {len(existing_symbols)}")
+
+        inst_df = _read_instruments(instruments_path)
+        inst_end_map = {}
+        for _, row in inst_df.iterrows():
+            sym = str(row["symbol"]).upper()
+            inst_end_map[sym] = str(row["end_datetime"])
+
+        try:
+            online_raw = get_us_stock_symbols(qlib_data_path=qlib_data_1d_dir)
+        except Exception:
+            try:
+                online_raw = get_us_stock_symbols()
+            except Exception:
+                online_raw = []
+        online_raw += ["^GSPC", "^NDX", "^DJI"]
+        online_symbols = {code_to_fname(s).upper() for s in online_raw}
+
+        all_symbols = existing_symbols | online_symbols
+        new_symbols = all_symbols - existing_symbols
+        logger.info(
+            f"Online: {len(online_symbols)}, "
+            f"New: {len(new_symbols)}, "
+            f"Total: {len(all_symbols)}"
         )
 
-        if pd.Timestamp(download_start) < pd.Timestamp(end_date):
-            # ----------------------------------------------------------
-            # Resume logic: detect stocks whose bin data is already
-            # up-to-date so we can skip redundant downloads on re-run.
-            # ----------------------------------------------------------
-            uptodate_symbols = _get_uptodate_symbols(qlib_data_1d_dir, end_date)
-            logger.info(f"Stocks already up-to-date in bin data: {len(uptodate_symbols)}")
+        # ========================================================
+        # Step 2: Incremental download — one loop for all symbols
+        # ========================================================
+        logger.info("=" * 60)
+        logger.info("Step 2: Incremental download")
+        logger.info("=" * 60)
 
-            # Count existing CSVs from a previous (possibly interrupted) run.
-            # We do NOT clear them — they serve as a download cache.
-            existing_csvs = {f.stem.upper() for f in runner.source_dir.glob("*.csv")}
-            if existing_csvs:
-                logger.info(
-                    f"Found {len(existing_csvs)} existing source CSVs from previous run (resume mode)"
-                )
+        runner = Run(
+            source_dir=None, normalize_dir=None,
+            max_workers=max_workers, interval="1d", region=region,
+        )
+        source_dir = runner.source_dir
 
-            # Always clear normalize dir (it's cheap to regenerate from source CSVs)
-            _clear_csv_dir(runner.normalize_dir)
+        UP_TO_DATE_TOLERANCE_DAYS = 3
+        MAX_CONSECUTIVE_FAILURES = 15
 
-            # --- Step 1a: Batch download from online symbol list ---
-            # Skip Phase 1a entirely if we already have enough CSVs from a previous
-            # run (threshold: 80% of original existing symbols). This means Phase 1a
-            # was likely completed before the interruption.
-            phase1a_threshold = int(len(original_existing_symbols) * 0.8)
-            if len(existing_csvs) >= phase1a_threshold and existing_csvs:
-                logger.info(
-                    f"Step 1a: SKIPPED — {len(existing_csvs)} CSVs already exist "
-                    f"(threshold: {phase1a_threshold}). Using cached data from previous run."
-                )
+        total = len(all_symbols)
+        downloaded = 0
+        skipped = 0
+        failed = 0
+        consecutive_failures = 0
+
+        logger.info(f"Scanning {total} symbols for incremental download...")
+
+        for i, sym_fname in enumerate(sorted(all_symbols), 1):
+            csv_path = source_dir / f"{sym_fname}.csv"
+            yahoo_symbol = fname_to_code(sym_fname.lower())
+
+            # --- Determine download range ---
+            csv_last = None
+            if csv_path.exists() and csv_path.stat().st_size > 100:
+                csv_last = _get_csv_last_date(csv_path)
+
+            if csv_last:
+                if pd.Timestamp(csv_last) >= pd.Timestamp(end_date) - pd.Timedelta(days=UP_TO_DATE_TOLERANCE_DAYS):
+                    skipped += 1
+                    continue
+                dl_start = csv_last
+            elif sym_fname in inst_end_map:
+                dl_start = inst_end_map[sym_fname]
             else:
-                logger.info(f"Step 1a: Batch downloading stocks: {download_start} ~ {end_date}")
-                runner.download_data(
-                    delay=delay, start=download_start, end=end_date,
-                    check_data_length=check_data_length
+                dl_start = "2000-01-01"
+
+            if pd.Timestamp(dl_start) >= pd.Timestamp(end_date):
+                skipped += 1
+                continue
+
+            if i % 500 == 0:
+                logger.info(
+                    f"  Progress: {i}/{total} "
+                    f"(downloaded={downloaded}, skipped={skipped}, failed={failed})"
                 )
 
-            # --- Step 1b: Supplement download for missed existing stocks ---
-            # Two categories need supplementing:
-            #   (a) Stocks not in the online list (ETFs, SPACs, etc.)
-            #   (b) Stocks whose end_datetime < download_start (stale outliers
-            #       that need an earlier start to create an overlap point)
-            downloaded_fnames = {f.stem.upper() for f in runner.source_dir.glob("*.csv")}
-            missed_existing = original_existing_symbols - downloaded_fnames
+            try:
+                time.sleep(delay)
+                raw_df = _fetch_stock_data_multi_source(
+                    symbol_yahoo=yahoo_symbol,
+                    symbol_fname=sym_fname,
+                    start=dl_start,
+                    end=end_date,
+                )
 
-            # Remove already up-to-date stocks from missed list — no need to
-            # re-download them; their bin data is already current.
-            if uptodate_symbols:
-                skipped_count = len(missed_existing & uptodate_symbols)
-                missed_existing -= uptodate_symbols
-                if skipped_count:
-                    logger.info(
-                        f"  Skipped {skipped_count} stocks already up-to-date in bin data"
+                if raw_df is None or raw_df.empty:
+                    consecutive_failures += 1
+                    failed += 1
+                    failure_logger.log(
+                        yahoo_symbol, dl_start, end_date, "empty_data",
+                        "All sources returned no data"
                     )
+                    if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                        logger.error(
+                            f"Rate limit likely ({consecutive_failures} consecutive "
+                            f"failures). Stopping download loop."
+                        )
+                        break
+                    continue
 
-            # Build per-stock start dates for stale outliers.
-            stale_start_map = {}  # symbol → per-stock download start
-            
-            for _, row in inst_df.iterrows():
-                sym = str(row["symbol"]).upper()
-                sym_end = pd.Timestamp(row["end_datetime"])
-                
-                if sym_end < pd.Timestamp(download_start):
-                    # This stock's end is earlier than the batch start;
-                    # it needs its own start date to create the overlap point.
-                    stale_start_map[sym] = (sym_end - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+                consecutive_failures = 0
 
-            # Stocks in the batch but stale — re-download with correct range
-            # Also exclude up-to-date stocks (they don't need re-downloading)
-            stale_in_batch = set(stale_start_map.keys()) & downloaded_fnames - uptodate_symbols
-            if stale_in_batch:
-                logger.info(
-                    f"Step 1b-stale: {len(stale_in_batch)} stale stocks need "
-                    f"wider download range (end < {download_start})"
-                )
-                _download_supplement_stocks(
-                    missed_symbols=stale_in_batch,
-                    source_dir=runner.source_dir,
-                    download_start=download_start,
-                    end_date=end_date,
-                    delay=delay,
-                    failure_logger=failure_logger,
-                    per_stock_start=stale_start_map,
-                )
+                if "_source" in raw_df.columns:
+                    raw_df = raw_df.drop(columns=["_source"])
 
-            if missed_existing:
-                # Merge stale start dates for missed symbols
-                missed_stale_map = {s: stale_start_map[s] for s in missed_existing if s in stale_start_map}
-                logger.info(
-                    f"Step 1b-missed: {len(missed_existing)} existing symbols not in batch download"
-                    + (f" ({len(missed_stale_map)} stale)" if missed_stale_map else "")
-                )
-                _download_supplement_stocks(
-                    missed_symbols=missed_existing,
-                    source_dir=runner.source_dir,
-                    download_start=download_start,
-                    end_date=end_date,
-                    delay=delay,
-                    failure_logger=failure_logger,
-                    per_stock_start=missed_stale_map if missed_stale_map else None,
-                )
-            else:
-                logger.info("Step 1b: All existing symbols covered by batch download")
+                if "date" not in raw_df.columns and hasattr(raw_df.index, "name") and raw_df.index.name == "date":
+                    raw_df = raw_df.reset_index()
 
-            # --- Step 2: Clean date formats in source CSVs before normalize ---
-            logger.info("Step 2: Cleaning date formats in source CSVs...")
-            _clean_csv_dates(runner.source_dir)
+                if "date" in raw_df.columns:
+                    try:
+                        raw_df["date"] = pd.to_datetime(
+                            raw_df["date"], utc=True
+                        ).dt.tz_localize(None).dt.strftime("%Y-%m-%d")
+                    except Exception:
+                        raw_df["date"] = pd.to_datetime(
+                            raw_df["date"]
+                        ).dt.strftime("%Y-%m-%d")
 
-            # --- Step 3: Normalize with extend mode ---
-            normalize_workers = min(max(multiprocessing.cpu_count() - 2, 1), 4)
-            runner.max_workers = normalize_workers
-            logger.info(f"Step 3: Normalizing data (extend mode, workers={normalize_workers})...")
-            runner.normalize_data_1d_extend(qlib_data_1d_dir)
+                raw_df["symbol"] = sym_fname
 
-            # --- Step 4: Dump to bin ---
-            logger.info("Step 4: Dumping to bin format...")
-            from dump_bin import DumpDataUpdate
-            _dump = DumpDataUpdate(
-                data_path=str(runner.normalize_dir),
-                qlib_dir=qlib_data_1d_dir,
-                exclude_fields="symbol,date",
-                max_workers=normalize_workers,
+                # Append to existing CSV (dedup by date) or create new
+                if csv_last and csv_path.exists():
+                    try:
+                        existing_df = pd.read_csv(csv_path, dtype={"symbol": str})
+                        combined = pd.concat([existing_df, raw_df], ignore_index=True)
+                        combined["_dt"] = pd.to_datetime(combined["date"], format="mixed")
+                        combined = combined.drop_duplicates(subset=["_dt"], keep="last")
+                        combined = combined.sort_values("_dt").reset_index(drop=True)
+                        combined["date"] = combined["_dt"].dt.strftime("%Y-%m-%d")
+                        combined = combined.drop(columns=["_dt"])
+                        combined.to_csv(csv_path, index=False)
+                    except Exception:
+                        raw_df.to_csv(csv_path, index=False)
+                else:
+                    raw_df.to_csv(csv_path, index=False)
+
+                downloaded += 1
+
+            except RateLimitError:
+                logger.error("Rate limit detected. Stopping download loop.")
+                break
+
+            except Exception as e:
+                consecutive_failures += 1
+                failed += 1
+                failure_logger.log(yahoo_symbol, dl_start, end_date, "error", str(e))
+                if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                    logger.error(
+                        f"Rate limit likely ({consecutive_failures} consecutive "
+                        f"failures). Stopping download loop."
+                    )
+                    break
+
+        logger.info(
+            f"Download complete: {downloaded} downloaded, "
+            f"{skipped} skipped, {failed} failed (out of {total})"
+        )
+
+        # ========================================================
+        # Step 3: Clean dates → Normalize → Dump
+        # ========================================================
+        logger.info("=" * 60)
+        logger.info("Step 3: Normalize and dump")
+        logger.info("=" * 60)
+
+        logger.info("Cleaning date formats in source CSVs...")
+        _clean_csv_dates(source_dir)
+
+        _clear_csv_dir(runner.normalize_dir)
+
+        normalize_workers = min(max(multiprocessing.cpu_count() - 2, 1), 4)
+        runner.max_workers = normalize_workers
+        logger.info(f"Normalizing data (extend mode, workers={normalize_workers})...")
+        runner.normalize_data_1d_extend(qlib_data_1d_dir)
+
+        logger.info("Dumping to bin format...")
+        from dump_bin import DumpDataUpdate
+        _dump = DumpDataUpdate(
+            data_path=str(runner.normalize_dir),
+            qlib_dir=qlib_data_1d_dir,
+            exclude_fields="symbol,date",
+            max_workers=normalize_workers,
+        )
+        _dump.dump()
+
+        # Parse index
+        _region = region.lower()
+        if _region in ["cn", "us"]:
+            index_list = (
+                ["CSI100", "CSI300"] if _region == "cn"
+                else ["SP500", "NASDAQ100", "DJIA", "SP400"]
             )
-            _dump.dump()
+            try:
+                get_instruments = getattr(
+                    importlib.import_module(f"data_collector.{_region}_index.collector"),
+                    "get_instruments",
+                )
+                for _index in index_list:
+                    try:
+                        get_instruments(
+                            str(qlib_data_1d_dir), _index,
+                            market_index=f"{_region}_index",
+                        )
+                    except Exception as e:
+                        logger.warning(f"Failed to parse index {_index}: {e}")
+            except Exception as e:
+                logger.warning(f"Failed to import index collector: {e}")
 
-            # --- Step 5: Parse index ---
-            _region = region.lower()
-            if _region in ["cn", "us"]:
-                index_list = ["CSI100", "CSI300"] if _region == "cn" else ["SP500", "NASDAQ100", "DJIA", "SP400"]
-                try:
-                    get_instruments = getattr(
-                        importlib.import_module(f"data_collector.{_region}_index.collector"),
-                        "get_instruments"
-                    )
-                    for _index in index_list:
-                        try:
-                            get_instruments(str(qlib_data_1d_dir), _index, market_index=f"{_region}_index")
-                        except Exception as e:
-                            logger.warning(f"Failed to parse index {_index}: {e}")
-                except Exception as e:
-                    logger.warning(f"Failed to import index collector: {e}")
-
-            logger.info("Phase 1 complete: existing stocks updated.")
-        else:
-            logger.info("Existing stocks already up to date.")
-
-    except Exception as e:
-        logger.error(f"Phase 1 encountered an error: {traceback.format_exc()}")
-        logger.info("Attempting to normalize and dump whatever data was downloaded so far...")
-        # Even on error, try to normalize/dump/reconcile whatever CSVs exist
+    except Exception:
+        logger.error(f"Update encountered an error: {traceback.format_exc()}")
+        logger.info("Attempting emergency normalize+dump on existing source CSVs...")
         try:
             os.chdir(str(ALL_SOURCE_DIR))
             from collector import Run
@@ -785,274 +617,27 @@ def update_qlib_data(
             if list(runner.source_dir.glob("*.csv")):
                 _clear_csv_dir(runner.normalize_dir)
                 _clean_csv_dates(runner.source_dir)
-                normalize_workers = min(max(multiprocessing.cpu_count() - 2, 1), 4)
-                runner.max_workers = normalize_workers
-                logger.info("Emergency normalize...")
+                nw = min(max(multiprocessing.cpu_count() - 2, 1), 4)
+                runner.max_workers = nw
                 runner.normalize_data_1d_extend(qlib_data_1d_dir)
-                logger.info("Emergency dump to bin...")
                 from dump_bin import DumpDataUpdate
-                _dump = DumpDataUpdate(
+                DumpDataUpdate(
                     data_path=str(runner.normalize_dir),
                     qlib_dir=qlib_data_1d_dir,
                     exclude_fields="symbol,date",
-                    max_workers=normalize_workers,
-                )
-                _dump.dump()
+                    max_workers=nw,
+                ).dump()
                 logger.info("Emergency normalize+dump complete.")
         except Exception as inner_e:
             logger.error(f"Emergency normalize+dump also failed: {inner_e}")
     finally:
         os.chdir(original_cwd)
 
-    # ========================================
-    # Reconcile all.txt from actual bin data
-    # ========================================
+    # ========================================================
+    # Step 4: Reconcile instruments/all.txt from bin data
+    # ========================================================
     logger.info("=" * 60)
-    logger.info("Reconciling instruments/all.txt from bin data (mid-point)...")
-    logger.info("=" * 60)
-    _reconcile_instruments_from_bin(qlib_data_1d_dir)
-
-    # ========================================
-    # Phase 2: Detect and add new stocks
-    # ========================================
-    logger.info("=" * 60)
-    logger.info("Phase 2: Detecting and adding new stocks")
-    logger.info("=" * 60)
-
-    os.chdir(str(ALL_SOURCE_DIR))
-    try:
-        from data_collector.utils import get_us_stock_symbols
-        from collector import YahooCollector, YahooNormalizeUS1d
-        from data_collector.base import Normalize
-        from dump_bin import DumpDataUpdate
-
-        # Re-read current symbols (after Phase 1 + reconciliation)
-        current_symbols = _get_existing_symbols(instruments_path)
-        logger.info(f"Current symbols after Phase 1 + reconciliation: {len(current_symbols)}")
-
-        # Get latest symbol list from internet.
-        # Pass qlib_data_path so index component stocks are included.
-        try:
-            latest_symbols_raw = get_us_stock_symbols(qlib_data_path=qlib_data_1d_dir)
-        except Exception as e:
-            logger.warning(f"get_us_stock_symbols with qlib_data_path failed, trying without: {e}")
-            try:
-                latest_symbols_raw = get_us_stock_symbols()
-            except Exception as e2:
-                logger.error(f"Failed to get latest symbol list: {e2}")
-                latest_symbols_raw = []
-
-        logger.info(f"Online symbol sources returned {len(latest_symbols_raw)} symbols")
-
-        latest_symbols = set()
-        for s in latest_symbols_raw:
-            fname = code_to_fname(s).upper()
-            latest_symbols.add(fname)
-
-        # Also check feature directories: Phase 1 DumpDataUpdate may have created
-        # feature dirs for stocks that exist in Yahoo but aren't yet in all.txt.
-        # These would have been picked up by reconciliation, but let's be safe.
-        features_dir = Path(qlib_data_1d_dir) / "features"
-        if features_dir.exists():
-            for stock_dir in features_dir.iterdir():
-                if stock_dir.is_dir():
-                    sym = fname_to_code(stock_dir.name).upper()
-                    if sym not in current_symbols:
-                        # Already has bin data but not in all.txt (reconciliation
-                        # should have caught this, but if bin was too small it
-                        # might have been skipped). Not truly "new".
-                        pass
-
-        new_symbols = latest_symbols - current_symbols
-
-        if not new_symbols:
-            logger.info("No new stocks to add.")
-        else:
-            logger.info(f"Detected {len(new_symbols)} new stocks to download")
-
-            source_dir = ALL_SOURCE_DIR / "source"
-            source_dir.mkdir(parents=True, exist_ok=True)
-            normalize_dir = ALL_SOURCE_DIR / "normalize"
-            normalize_dir.mkdir(parents=True, exist_ok=True)
-
-            from data_collector.utils import RateLimitError as _RLE
-
-            MAX_CONSECUTIVE_FAILURES = 15
-            processed = 0
-            success = 0
-            skipped_csv = 0
-            stooq_hits = 0
-            consecutive_failures = 0
-            rate_limited = False
-
-            for sym_fname in sorted(new_symbols):
-                yahoo_symbol = fname_to_code(sym_fname)
-
-                processed += 1
-
-                # Resume: skip if CSV already exists from a previous run
-                csv_path = source_dir / f"{sym_fname}.csv"
-                if csv_path.exists() and csv_path.stat().st_size > 100:
-                    skipped_csv += 1
-                    success += 1  # count as success for progress
-                    continue
-
-                if processed % 200 == 0 or processed == len(new_symbols):
-                    logger.info(
-                        f"  New stock progress: {processed}/{len(new_symbols)} "
-                        f"({success} success, {stooq_hits} from Stooq, {skipped_csv} cached)"
-                    )
-
-                try:
-                    time.sleep(delay)
-                    raw_df = _fetch_stock_data_multi_source(
-                        symbol_yahoo=yahoo_symbol,
-                        symbol_fname=sym_fname,
-                        start="2000-01-01",
-                        end=end_date,
-                    )
-
-                    if raw_df is None or raw_df.empty:
-                        consecutive_failures += 1
-                        failure_logger.log(
-                            yahoo_symbol, "2000-01-01", end_date, "empty_data",
-                            "Yahoo + Stooq + NDL all returned no data — possibly delisted or not yet listed"
-                        )
-                        if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
-                            logger.error(
-                                f"RATE LIMIT DETECTED: {consecutive_failures} consecutive "
-                                f"failures in Phase 2. Stopping new-stock download."
-                            )
-                            rate_limited = True
-                            break
-                        continue
-
-                    consecutive_failures = 0  # Reset on success
-
-                    # Track source
-                    if "_source" in raw_df.columns:
-                        if (raw_df["_source"] == "stooq").any():
-                            stooq_hits += 1
-                        raw_df = raw_df.drop(columns=["_source"])
-
-                    # Ensure 'date' is a column (not index)
-                    if "date" not in raw_df.columns and hasattr(raw_df.index, "name") and raw_df.index.name == "date":
-                        raw_df = raw_df.reset_index()
-
-                    # Clean date column: strip timezone, keep YYYY-MM-DD only
-                    if "date" in raw_df.columns:
-                        try:
-                            raw_df["date"] = pd.to_datetime(
-                                raw_df["date"], utc=True
-                            ).dt.tz_localize(None).dt.strftime("%Y-%m-%d")
-                        except Exception:
-                            # Stooq dates may already be plain strings
-                            raw_df["date"] = pd.to_datetime(
-                                raw_df["date"]
-                            ).dt.strftime("%Y-%m-%d")
-
-                    raw_df["symbol"] = sym_fname
-                    csv_path = source_dir / f"{sym_fname}.csv"
-                    raw_df.to_csv(csv_path, index=False)
-                    success += 1
-
-                except _RLE as e:
-                    logger.error(f"RATE LIMIT DETECTED in Phase 2: {e}")
-                    rate_limited = True
-                    break
-
-                except Exception as e:
-                    consecutive_failures += 1
-                    failure_logger.log(
-                        yahoo_symbol, "2000-01-01", end_date, "network_error", str(e)
-                    )
-                    if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
-                        logger.error(
-                            f"RATE LIMIT DETECTED: {consecutive_failures} consecutive "
-                            f"failures in Phase 2. Stopping new-stock download."
-                        )
-                        rate_limited = True
-                        break
-                    continue
-
-            logger.info(
-                f"New stock download: {success}/{len(new_symbols)} succeeded "
-                f"({stooq_hits} from Stooq, {skipped_csv} from cache)"
-            )
-
-            # Normalize only new stock CSVs (don't re-normalize Phase 1 data)
-            new_csv_files = [
-                source_dir / f"{sym}.csv"
-                for sym in sorted(new_symbols)
-                if (source_dir / f"{sym}.csv").exists()
-            ]
-            if new_csv_files:
-                logger.info(f"Normalizing {len(new_csv_files)} new stocks...")
-                norm_obj = YahooNormalizeUS1d(
-                    date_field_name="date", symbol_field_name="symbol"
-                )
-                default_na = pd._libs.parsers.STR_NA_VALUES
-                symbol_na = default_na.copy()
-                symbol_na.remove("NA")
-                for _csv in new_csv_files:
-                    try:
-                        cols = pd.read_csv(_csv, nrows=0).columns
-                        _df = pd.read_csv(
-                            _csv,
-                            dtype={"symbol": str},
-                            keep_default_na=False,
-                            na_values={
-                                c: symbol_na if c == "symbol" else default_na
-                                for c in cols
-                            },
-                        )
-                        _df = norm_obj.normalize(_df)
-                        if _df is not None and not _df.empty:
-                            _df.to_csv(
-                                normalize_dir / _csv.name, index=False
-                            )
-                    except Exception as e:
-                        logger.warning(f"normalize {_csv.name} failed: {e}")
-
-            # Dump only newly normalized CSVs via a transient temp dir
-            new_norm_files = [
-                normalize_dir / f"{sym}.csv"
-                for sym in sorted(new_symbols)
-                if (normalize_dir / f"{sym}.csv").exists()
-            ]
-            if new_norm_files:
-                logger.info(f"Dumping {len(new_norm_files)} new stocks to bin...")
-                with tempfile.TemporaryDirectory() as _tmp_dump:
-                    for _f in new_norm_files:
-                        shutil.copy2(_f, Path(_tmp_dump) / _f.name)
-                    _dump = DumpDataUpdate(
-                        data_path=_tmp_dump,
-                        qlib_dir=qlib_data_1d_dir,
-                        exclude_fields="symbol,date",
-                        max_workers=min(
-                            max(multiprocessing.cpu_count() - 2, 1), 4
-                        ),
-                    )
-                    _dump.dump()
-
-            if rate_limited:
-                logger.error(
-                    "RATE LIMIT: Phase 2 stopped early. Already-downloaded data has been "
-                    "saved. Wait 15-30 minutes then re-run with a higher --delay."
-                )
-
-        logger.info("Phase 2 complete.")
-
-    except Exception as e:
-        logger.error(f"Phase 2 failed: {traceback.format_exc()}")
-    finally:
-        os.chdir(original_cwd)
-
-    # ========================================
-    # Final reconciliation
-    # ========================================
-    logger.info("=" * 60)
-    logger.info("Final reconciliation of instruments/all.txt from bin data...")
+    logger.info("Reconciling instruments/all.txt from bin data...")
     logger.info("=" * 60)
     final_df = _reconcile_instruments_from_bin(qlib_data_1d_dir)
 
@@ -1068,11 +653,10 @@ def update_qlib_data(
                 f"Check {failure_logger.fail_log_path} for details."
             )
 
-    # Save failure log
     failure_logger.save()
 
     logger.info("=" * 60)
-    logger.info("Full market update complete.")
+    logger.info("Incremental market update complete.")
     logger.info("=" * 60)
 
 
