@@ -27,6 +27,9 @@ import multiprocessing
 from pathlib import Path
 from typing import Optional, List
 
+import shutil
+import tempfile
+
 import fire
 import numpy as np
 import pandas as pd
@@ -867,14 +870,10 @@ def update_qlib_data(
         else:
             logger.info(f"Detected {len(new_symbols)} new stocks to download")
 
-            source_dir_new = ALL_SOURCE_DIR / "source_new"
-            source_dir_new.mkdir(parents=True, exist_ok=True)
-            normalize_dir_new = ALL_SOURCE_DIR / "normalize_new"
-            normalize_dir_new.mkdir(parents=True, exist_ok=True)
-
-            # Don't clear source CSVs — they act as a download cache for resume.
-            # Only clear normalize dir (cheap to regenerate).
-            _clear_csv_dir(normalize_dir_new)
+            source_dir = ALL_SOURCE_DIR / "source"
+            source_dir.mkdir(parents=True, exist_ok=True)
+            normalize_dir = ALL_SOURCE_DIR / "normalize"
+            normalize_dir.mkdir(parents=True, exist_ok=True)
 
             from data_collector.utils import RateLimitError as _RLE
 
@@ -892,7 +891,7 @@ def update_qlib_data(
                 processed += 1
 
                 # Resume: skip if CSV already exists from a previous run
-                csv_path = source_dir_new / f"{sym_fname}.csv"
+                csv_path = source_dir / f"{sym_fname}.csv"
                 if csv_path.exists() and csv_path.stat().st_size > 100:
                     skipped_csv += 1
                     success += 1  # count as success for progress
@@ -953,7 +952,7 @@ def update_qlib_data(
                             ).dt.strftime("%Y-%m-%d")
 
                     raw_df["symbol"] = sym_fname
-                    csv_path = source_dir_new / f"{sym_fname}.csv"
+                    csv_path = source_dir / f"{sym_fname}.csv"
                     raw_df.to_csv(csv_path, index=False)
                     success += 1
 
@@ -981,40 +980,60 @@ def update_qlib_data(
                 f"({stooq_hits} from Stooq, {skipped_csv} from cache)"
             )
 
-            # Normalize + dump whatever we downloaded (even if rate-limited mid-way)
-            if list(source_dir_new.glob("*.csv")):
-                logger.info("Normalizing new stocks...")
-                normalizer = Normalize(
-                    source_dir=source_dir_new,
-                    target_dir=normalize_dir_new,
-                    normalize_class=YahooNormalizeUS1d,
-                    max_workers=min(max(multiprocessing.cpu_count() - 2, 1), 4),
-                    date_field_name="date",
-                    symbol_field_name="symbol",
+            # Normalize only new stock CSVs (don't re-normalize Phase 1 data)
+            new_csv_files = [
+                source_dir / f"{sym}.csv"
+                for sym in sorted(new_symbols)
+                if (source_dir / f"{sym}.csv").exists()
+            ]
+            if new_csv_files:
+                logger.info(f"Normalizing {len(new_csv_files)} new stocks...")
+                norm_obj = YahooNormalizeUS1d(
+                    date_field_name="date", symbol_field_name="symbol"
                 )
-                normalizer.normalize()
+                default_na = pd._libs.parsers.STR_NA_VALUES
+                symbol_na = default_na.copy()
+                symbol_na.remove("NA")
+                for _csv in new_csv_files:
+                    try:
+                        cols = pd.read_csv(_csv, nrows=0).columns
+                        _df = pd.read_csv(
+                            _csv,
+                            dtype={"symbol": str},
+                            keep_default_na=False,
+                            na_values={
+                                c: symbol_na if c == "symbol" else default_na
+                                for c in cols
+                            },
+                        )
+                        _df = norm_obj.normalize(_df)
+                        if _df is not None and not _df.empty:
+                            _df.to_csv(
+                                normalize_dir / _csv.name, index=False
+                            )
+                    except Exception as e:
+                        logger.warning(f"normalize {_csv.name} failed: {e}")
 
-            if list(normalize_dir_new.glob("*.csv")):
-                logger.info("Dumping new stocks to bin...")
-                _dump = DumpDataUpdate(
-                    data_path=str(normalize_dir_new),
-                    qlib_dir=qlib_data_1d_dir,
-                    exclude_fields="symbol,date",
-                    max_workers=min(max(multiprocessing.cpu_count() - 2, 1), 4),
-                )
-                _dump.dump()
-
-            # Cleanup: only clear source CSVs AFTER successful dump.
-            # This ensures they serve as a resume cache if the script
-            # is interrupted before dump completes.
-            if not rate_limited:
-                _clear_csv_dir(source_dir_new)
-                _clear_csv_dir(normalize_dir_new)
-            else:
-                logger.info(
-                    "Keeping source CSVs as cache (rate-limited). "
-                    "Re-run later to continue downloading remaining new stocks."
-                )
+            # Dump only newly normalized CSVs via a transient temp dir
+            new_norm_files = [
+                normalize_dir / f"{sym}.csv"
+                for sym in sorted(new_symbols)
+                if (normalize_dir / f"{sym}.csv").exists()
+            ]
+            if new_norm_files:
+                logger.info(f"Dumping {len(new_norm_files)} new stocks to bin...")
+                with tempfile.TemporaryDirectory() as _tmp_dump:
+                    for _f in new_norm_files:
+                        shutil.copy2(_f, Path(_tmp_dump) / _f.name)
+                    _dump = DumpDataUpdate(
+                        data_path=_tmp_dump,
+                        qlib_dir=qlib_data_1d_dir,
+                        exclude_fields="symbol,date",
+                        max_workers=min(
+                            max(multiprocessing.cpu_count() - 2, 1), 4
+                        ),
+                    )
+                    _dump.dump()
 
             if rate_limited:
                 logger.error(

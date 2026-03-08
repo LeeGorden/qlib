@@ -771,7 +771,80 @@ class YahooNormalizeUS:
 
 
 class YahooNormalizeUS1d(YahooNormalizeUS, YahooNormalize1d):
-    pass
+    """US 1d normalize: standard Qlib fields use split-adjusted (split-only) prices.
+
+    Yahoo's OHLCV is already split-adjusted retroactively, so standard fields
+    (open/high/low/close/volume) directly use Yahoo values — no adjclose factor,
+    no first-close normalization.
+
+    Additional columns preserved in output CSV:
+        *_raw     : reconstructed original trading prices (pre-split scale)
+        close_adj : Yahoo Adj Close (split + dividend adjusted, total-return)
+    """
+
+    SPLIT_ADJ_PRICE_COLS = ["open", "high", "low", "close"]
+
+    @staticmethod
+    def _compute_split_factor(df: pd.DataFrame) -> pd.Series:
+        """Cumulative split factor F_split(t) = prod(split_ratio(tau), tau in (t, today]).
+
+        The interval is OPEN on the left: the split on day t itself is NOT
+        included, because Yahoo's price on the split date is already post-split.
+
+        For the last trading day F_split = 1.  For a date before a 10:1 split,
+        F_split = 10, meaning:
+            price_raw  = price_yahoo * F_split   (reconstruct pre-split price)
+            volume_raw = volume_yahoo / F_split   (reconstruct pre-split volume)
+        """
+        if "splits" not in df.columns:
+            return pd.Series(1.0, index=df.index)
+
+        splits = df["splits"].fillna(0.0).astype(float)
+        splits = splits.where(splits != 0.0, 1.0)
+
+        # Shift left by 1 so that position t gets the split ratio from t+1,
+        # implementing the open-left interval (t, today].
+        splits_after = splits.shift(-1).fillna(1.0)
+        F_split = splits_after[::-1].cumprod()[::-1]
+
+        return F_split
+
+    def normalize(self, df: pd.DataFrame) -> pd.DataFrame:
+        # --- Step 1: basic yahoo cleanup (dates, dedup, calendar reindex, 89-111 fix) ---
+        df = self.normalize_yahoo(
+            df, self._calendar_list, self._date_field_name, self._symbol_field_name
+        )
+        if df.empty:
+            return df
+
+        df = df.copy()
+        df.set_index(self._date_field_name, inplace=True)
+
+        # --- Step 2: cumulative split factor ---
+        F_split = self._compute_split_factor(df)
+
+        # --- Step 3: raw columns (reconstruct original trading-day prices) ---
+        for col in self.SPLIT_ADJ_PRICE_COLS:
+            if col in df.columns:
+                df[f"{col}_raw"] = df[col] * F_split
+        df["volume_raw"] = df["volume"] / F_split if "volume" in df.columns else np.nan
+
+        # --- Step 4: total-return adjusted close (split + dividend) ---
+        if "adjclose" in df.columns:
+            df["close_adj"] = df["adjclose"]
+
+        # --- Step 5: standard Qlib fields = Yahoo OHLCV (already split-adjusted) ---
+        #   open/high/low/close/volume stay as-is; NO adjclose factor, NO first-close norm.
+
+        # --- Step 6: factor (dividend-only ratio, for reference / compatibility) ---
+        if "adjclose" in df.columns and "close" in df.columns:
+            df["factor"] = df["adjclose"] / df["close"]
+            df["factor"] = df["factor"].ffill()
+        else:
+            df["factor"] = 1.0
+
+        df.index.names = [self._date_field_name]
+        return df.reset_index()
 
 
 class YahooNormalizeUS1dExtend(YahooNormalizeUS, YahooNormalize1dExtend):

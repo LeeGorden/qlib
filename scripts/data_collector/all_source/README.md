@@ -273,3 +273,45 @@ python scripts/update_qlib_data.py --qlib_data_1d_dir <path> --end_date 2026-02-
 | `scripts/data_collector/all_source/collector.py` | Stooq/NDL fallbacks, rate-limit detection, mixed date format fix |
 | `scripts/data_collector/utils.py` | `RateLimitError`, `deco_retry` fix, `get_us_stock_symbols` merges `all.txt` |
 | `scripts/data_collector/base.py` | No logic change (normalize failure is a warning, not fatal) |
+
+### US 1d Split-Adjusted Normalize (`YahooNormalizeUS1d`)
+
+Overrode `YahooNormalizeUS1d.normalize()` to fix price scale pollution in Alpha158/360 factors caused by dividend adjustments and first-close normalization.
+
+**Before**: `close` was `adjclose / first_close` (split + dividend adjusted, then normalized) — NVDA showed ~1300 instead of ~120.
+
+**After**: `close` = Yahoo's OHLCV directly (split-adjusted only, actual dollar price).
+
+#### Normalize output columns (US 1d)
+
+| Column | Adjustment | Description |
+|--------|-----------|-------------|
+| `open/high/low/close` | Split only | Standard Qlib fields for Alpha158/360. Same as Yahoo OHLCV (already split-adjusted retroactively). Price in actual dollars. |
+| `volume` | Split only | Standard Qlib volume field. Yahoo adjusts historical volume for splits. |
+| `open_raw/high_raw/low_raw/close_raw` | None | Reconstructed original trading-day prices (`price × F_split`). Shows pre-split prices as they appeared on screen that day. Has jumps at split dates. |
+| `volume_raw` | None | Reconstructed original trading-day volume (`volume / F_split`). |
+| `close_adj` | Split + Dividend | Yahoo Adj Close (total-return). Use for precise return calculation / backtesting. |
+| `adjclose` | Split + Dividend | Original Yahoo adjclose (kept for compatibility). Same value as `close_adj`. |
+| `change` | — | Day-over-day return based on split-adjusted close. |
+| `factor` | — | `adjclose / close` (dividend-only ratio). |
+| `dividends` | — | Cash dividend per share on ex-date (from Yahoo). |
+| `splits` | — | Split ratio on split date (e.g. 10.0 for 10:1). 0 on non-split days. |
+
+#### Split factor calculation
+
+```
+F_split(t) = ∏ split_ratio(τ),  τ ∈ (t, today]
+```
+
+- Open-left interval: the split on day `t` itself is excluded (Yahoo's price on split day is already post-split).
+- `price_raw = price_yahoo × F_split` (reconstruct pre-split price)
+- `volume_raw = volume_yahoo / F_split` (reconstruct pre-split volume)
+- For the last trading day, `F_split = 1`.
+
+#### Key behavior
+
+- `$close` for NVDA at 2026-02-09 ≈ $190 (actual dollars, not 2000+)
+- `close_raw` shows ~10x jump around NVDA's 2024-06-10 10:1 split
+- `close` (standard) has no jump — continuous split-adjusted series
+- `adjusted_price()` and `_manual_adj_data()` are **skipped** for US 1d
+- `YahooNormalizeUS1dExtend` (incremental update) is **not affected**
