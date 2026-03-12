@@ -3,14 +3,15 @@
 # MODIFIED: New script — update a single stock in qlib data directory
 
 """
-Update a single stock's data in the qlib data directory.
+Update single / batch stocks in the qlib data directory.
 
-Usage (run from quant_finance/qlib/scripts/data_collector/all_source/):
-    python ../../../scripts/update_single_stock.py --symbol AAPL --qlib_data_1d_dir ~/.qlib/qlib_data/us_data --end_date 2026-02-14 --region US
-
-Or from quant_finance/qlib/scripts/:
+Single stock:
     cd data_collector/all_source
-    python ../../update_single_stock.py --symbol AAPL --qlib_data_1d_dir ~/.qlib/qlib_data/us_data
+    python ../../update_single_stock.py single --symbol AAPL --qlib_data_1d_dir qlib_data/us_data
+
+Batch update from a txt file (one symbol per line):
+    cd data_collector/all_source
+    python ../../update_single_stock.py batch --symbols_file watchlist.txt --qlib_data_1d_dir qlib_data/us_data
 """
 
 import os
@@ -23,6 +24,7 @@ import multiprocessing
 from pathlib import Path
 from typing import Optional
 
+from tqdm import tqdm
 import fire
 import numpy as np
 import pandas as pd
@@ -250,7 +252,7 @@ def update_single_stock(
     logger.info(f"Downloaded {len(raw_df)} rows for {symbol} (source: {data_source})")
 
     # === Step 2: Save raw CSV ===
-    source_dir = ALL_SOURCE_DIR / "source_single"
+    source_dir = ALL_SOURCE_DIR / "source"
     source_dir.mkdir(parents=True, exist_ok=True)
 
     raw_df["symbol"] = symbol_fname
@@ -260,17 +262,15 @@ def update_single_stock(
 
     # === Step 3: Normalize ===
     logger.info(f"Step 2: Normalizing data...")
-    normalize_dir = ALL_SOURCE_DIR / "normalize_single"
+    normalize_dir = ALL_SOURCE_DIR / "normalize"
     normalize_dir.mkdir(parents=True, exist_ok=True)
 
     is_new_stock = not (existing_mask.any() and feature_dir.exists())
 
     try:
         if is_new_stock:
-            # New stock: use standard YahooNormalize1d
             from collector import YahooNormalizeUS1d
             from data_collector.base import Normalize
-
             normalizer = Normalize(
                 source_dir=source_dir,
                 target_dir=normalize_dir,
@@ -279,12 +279,9 @@ def update_single_stock(
                 date_field_name="date",
                 symbol_field_name="symbol",
             )
-            normalizer.normalize()
         else:
-            # Existing stock: use YahooNormalize1dExtend
             from collector import YahooNormalizeUS1dExtend
             from data_collector.base import Normalize
-
             normalizer = Normalize(
                 source_dir=source_dir,
                 target_dir=normalize_dir,
@@ -294,19 +291,71 @@ def update_single_stock(
                 symbol_field_name="symbol",
                 old_qlib_data_dir=qlib_data_1d_dir,
             )
-            normalizer.normalize()
     except Exception as e:
         failure_logger.log(symbol, start_date, end_date, "normalize_error", str(e))
         failure_logger.save()
         logger.error(f"Normalize failed: {traceback.format_exc()}")
         return
 
-    # Check if normalized file exists
+    # Retry loop: if normalize fails at a bad early date, truncate source and retry.
+    # _executor processes one file and logs a WARNING on failure (never raises).
+    # We capture that WARNING to extract the failing date, then trim the CSV.
+    # If the failure is at the very start of remaining data (stuck), skip an entire year.
+    import re as _re
     norm_csv = normalize_dir / f"{symbol_fname}.csv"
+    current_source_df = pd.read_csv(csv_path)
+    current_source_df["date"] = pd.to_datetime(current_source_df["date"])
+
+    for _attempt in range(20):
+        _failed_dates = []
+
+        def _make_sink(bucket):
+            def _sink(msg):
+                text = str(msg.record["message"])
+                if msg.record["level"].name == "WARNING" and "failed" in text:
+                    m = _re.search(r'datetime\.date\((\d+),\s*(\d+),\s*(\d+)\)', text)
+                    if m:
+                        bucket.append(pd.Timestamp(int(m.group(1)), int(m.group(2)), int(m.group(3))))
+            return _sink
+
+        _sink_id = logger.add(_make_sink(_failed_dates), level="WARNING")
+        try:
+            normalizer._executor(csv_path)
+        finally:
+            logger.remove(_sink_id)
+
+        if norm_csv.exists():
+            break  # success
+
+        if not _failed_dates:
+            logger.warning(f"Normalize failed with no recoverable date info, giving up")
+            break
+
+        cutoff = max(_failed_dates)
+        min_date = current_source_df["date"].min()
+
+        # If failure is at or near the start of remaining data, skip an entire year
+        # (consecutive per-day failures mean the entire year's data is unusable)
+        if (cutoff - min_date).days <= 5:
+            cutoff = pd.Timestamp(cutoff.year + 1, 1, 1)
+            logger.warning(f"Normalize stuck at start of data, jumping to {cutoff.date()}")
+
+        trimmed = current_source_df[current_source_df["date"] >= cutoff]
+        if trimmed.empty:
+            logger.warning(f"No data remains after truncating to {cutoff.date()}, giving up")
+            break
+        current_source_df = trimmed.copy()
+        current_source_df["symbol"] = symbol_fname
+        current_source_df.to_csv(csv_path, index=False)
+        logger.warning(
+            f"Normalize failed at {max(_failed_dates).date()}, retrying with data from "
+            f"{current_source_df['date'].min().date()} ({len(current_source_df)} rows)"
+        )
+
     if not norm_csv.exists():
         failure_logger.log(
             symbol, start_date, end_date, "normalize_error",
-            "Normalized CSV not produced"
+            "Normalized CSV not produced after retries"
         )
         failure_logger.save()
         return
@@ -362,15 +411,8 @@ def update_single_stock(
     else:
         logger.warning(f"Feature dir not found after dump: {feature_dir}")
 
-    # === Step 6: Cleanup temp files ===
-    logger.info(f"Step 5: Cleaning up temp files...")
-    try:
-        for f in source_dir.glob("*.csv"):
-            f.unlink()
-        for f in normalize_dir.glob("*.csv"):
-            f.unlink()
-    except Exception as e:
-        logger.warning(f"Cleanup warning: {e}")
+    # source/ and normalize/ are permanent directories shared with the bulk pipeline.
+    # Files are kept (not cleaned up) so the next update_qlib_data.py run can use them.
 
     # Save failure log
     failure_logger.save()
@@ -380,5 +422,112 @@ def update_single_stock(
     logger.info(f"  Feature dir: {feature_dir}")
 
 
+UP_TO_DATE_TOLERANCE_DAYS = 3
+
+
+def batch_update(
+    symbols_file: str,
+    qlib_data_1d_dir: str = "~/.qlib/qlib_data/us_data",
+    end_date: str = None,
+    region: str = "US",
+    delay: float = 1,
+    fail_log: str = "./batch_update_fail_log.csv",
+):
+    """Batch-update stocks listed in a text file.
+
+    Parameters
+    ----------
+    symbols_file : str
+        Path to a text file with one symbol per line.
+        Empty lines and lines starting with '#' are ignored.
+    qlib_data_1d_dir : str
+        qlib data directory
+    end_date : str
+        End date (exclusive). Default = today.
+    region : str
+        Market region, default US
+    delay : float
+        Delay between downloads (seconds)
+    fail_log : str
+        Path for failure log CSV
+    """
+    symbols_path = Path(symbols_file).expanduser().resolve()
+    if not symbols_path.exists():
+        logger.error(f"Symbols file not found: {symbols_path}")
+        return
+
+    symbols = []
+    for line in symbols_path.read_text(encoding="utf-8").splitlines():
+        s = line.strip()
+        if s and not s.startswith("#"):
+            symbols.append(s.upper())
+
+    if not symbols:
+        logger.warning("No symbols found in file.")
+        return
+
+    symbols = list(dict.fromkeys(symbols))  # deduplicate, preserve order
+
+    qlib_data_1d_dir = str(Path(qlib_data_1d_dir).expanduser().resolve())
+
+    if end_date is None:
+        end_date = datetime.datetime.now().strftime("%Y-%m-%d")
+    today_str = datetime.datetime.now().strftime("%Y-%m-%d")
+    if pd.Timestamp(end_date) > pd.Timestamp(today_str):
+        end_date = today_str
+
+    instruments_path = Path(qlib_data_1d_dir) / "instruments" / "all.txt"
+    inst_df = _read_instruments(instruments_path)
+    inst_end_map = {}
+    for _, row in inst_df.iterrows():
+        inst_end_map[row["symbol"].upper()] = row["end_datetime"]
+
+    updated = 0
+    skipped = 0
+    failed = 0
+
+    logger.info(f"Batch update: {len(symbols)} symbols, end_date={end_date}")
+
+    pbar = tqdm(symbols, desc="Batch update", unit="sym",
+                bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}")
+
+    for sym in pbar:
+        sym_fname = code_to_fname(sym)
+        feature_dir = Path(qlib_data_1d_dir) / "features" / sym_fname
+
+        # Pre-check: if the stock exists and its end_datetime is recent enough, skip
+        if sym_fname in inst_end_map and feature_dir.exists():
+            inst_end = inst_end_map[sym_fname]
+            if pd.Timestamp(inst_end) >= pd.Timestamp(end_date) - pd.Timedelta(days=UP_TO_DATE_TOLERANCE_DAYS):
+                skipped += 1
+                pbar.set_postfix(ok=updated, skip=skipped, fail=failed, refresh=False)
+                continue
+
+        try:
+            update_single_stock(
+                symbol=sym,
+                qlib_data_1d_dir=qlib_data_1d_dir,
+                end_date=end_date,
+                region=region,
+                delay=delay,
+                fail_log=fail_log,
+            )
+            updated += 1
+        except Exception as e:
+            failed += 1
+            logger.error(f"[{sym}] batch update failed: {e}")
+
+        pbar.set_postfix(ok=updated, skip=skipped, fail=failed, refresh=False)
+
+    pbar.close()
+    logger.info(
+        f"Batch update complete: {updated} updated, {skipped} skipped, "
+        f"{failed} failed (total {len(symbols)})"
+    )
+
+
 if __name__ == "__main__":
-    fire.Fire(update_single_stock)
+    fire.Fire({
+        "single": update_single_stock,
+        "batch": batch_update,
+    })

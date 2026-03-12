@@ -777,40 +777,13 @@ class YahooNormalizeUS1d(YahooNormalizeUS, YahooNormalize1d):
     (open/high/low/close/volume) directly use Yahoo values — no adjclose factor,
     no first-close normalization.
 
-    Additional columns preserved in output CSV:
-        *_raw     : reconstructed original trading prices (pre-split scale)
-        close_adj : Yahoo Adj Close (split + dividend adjusted, total-return)
+    Output columns: date, symbol, open, high, low, close, volume, adjclose,
+                    change, factor
     """
 
-    SPLIT_ADJ_PRICE_COLS = ["open", "high", "low", "close"]
-
-    @staticmethod
-    def _compute_split_factor(df: pd.DataFrame) -> pd.Series:
-        """Cumulative split factor F_split(t) = prod(split_ratio(tau), tau in (t, today]).
-
-        The interval is OPEN on the left: the split on day t itself is NOT
-        included, because Yahoo's price on the split date is already post-split.
-
-        For the last trading day F_split = 1.  For a date before a 10:1 split,
-        F_split = 10, meaning:
-            price_raw  = price_yahoo * F_split   (reconstruct pre-split price)
-            volume_raw = volume_yahoo / F_split   (reconstruct pre-split volume)
-        """
-        if "splits" not in df.columns:
-            return pd.Series(1.0, index=df.index)
-
-        splits = df["splits"].fillna(0.0).astype(float)
-        splits = splits.where(splits != 0.0, 1.0)
-
-        # Shift left by 1 so that position t gets the split ratio from t+1,
-        # implementing the open-left interval (t, today].
-        splits_after = splits.shift(-1).fillna(1.0)
-        F_split = splits_after[::-1].cumprod()[::-1]
-
-        return F_split
+    KEEP_COLS = ["open", "high", "low", "close", "volume", "adjclose", "change", "factor"]
 
     def normalize(self, df: pd.DataFrame) -> pd.DataFrame:
-        # --- Step 1: basic yahoo cleanup (dates, dedup, calendar reindex, 89-111 fix) ---
         df = self.normalize_yahoo(
             df, self._calendar_list, self._date_field_name, self._symbol_field_name
         )
@@ -820,35 +793,63 @@ class YahooNormalizeUS1d(YahooNormalizeUS, YahooNormalize1d):
         df = df.copy()
         df.set_index(self._date_field_name, inplace=True)
 
-        # --- Step 2: cumulative split factor ---
-        F_split = self._compute_split_factor(df)
-
-        # --- Step 3: raw columns (reconstruct original trading-day prices) ---
-        for col in self.SPLIT_ADJ_PRICE_COLS:
-            if col in df.columns:
-                df[f"{col}_raw"] = df[col] * F_split
-        df["volume_raw"] = df["volume"] / F_split if "volume" in df.columns else np.nan
-
-        # --- Step 4: total-return adjusted close (split + dividend) ---
-        if "adjclose" in df.columns:
-            df["close_adj"] = df["adjclose"]
-
-        # --- Step 5: standard Qlib fields = Yahoo OHLCV (already split-adjusted) ---
-        #   open/high/low/close/volume stay as-is; NO adjclose factor, NO first-close norm.
-
-        # --- Step 6: factor (dividend-only ratio, for reference / compatibility) ---
         if "adjclose" in df.columns and "close" in df.columns:
             df["factor"] = df["adjclose"] / df["close"]
             df["factor"] = df["factor"].ffill()
         else:
             df["factor"] = 1.0
 
+        keep = [c for c in self.KEEP_COLS if c in df.columns]
+        keep.append(self._symbol_field_name)
+        df = df[keep]
+
         df.index.names = [self._date_field_name]
         return df.reset_index()
 
 
-class YahooNormalizeUS1dExtend(YahooNormalizeUS, YahooNormalize1dExtend):
-    pass
+class YahooNormalizeUS1dExtend(YahooNormalizeUS1d, YahooNormalize1dExtend):
+    """US 1d extend normalize: split-adjusted base + incremental stitching.
+
+    Inherits split-adjusted logic from YahooNormalizeUS1d (no adjclose factor,
+    no first-close normalization), then stitches new rows with existing qlib
+    binary data so that DumpDataUpdate can append seamlessly.
+    """
+
+    def normalize(self, df: pd.DataFrame) -> pd.DataFrame:
+        df = YahooNormalizeUS1d.normalize(self, df)
+        if df.empty:
+            return df
+
+        df.set_index(self._date_field_name, inplace=True)
+        symbol_name = df[self._symbol_field_name].iloc[0]
+        old_symbol_list = self.old_qlib_data.index.get_level_values("instrument").unique().to_list()
+
+        if str(symbol_name).upper() not in old_symbol_list:
+            logger.info(f"New symbol {symbol_name} not in old data, using standard normalize")
+            return df.reset_index()
+
+        old_df = self.old_qlib_data.loc[str(symbol_name).upper()]
+        latest_date = old_df.index[-1]
+        df = df.loc[latest_date:]
+
+        if df.empty:
+            return df.reset_index()
+
+        new_latest_data = df.iloc[0]
+        old_latest_data = old_df.loc[latest_date]
+
+        for col in self.column_list[:-1]:
+            old_val = old_latest_data.get(col, np.nan) if isinstance(old_latest_data, pd.Series) else old_latest_data
+            new_val = new_latest_data.get(col, np.nan) if isinstance(new_latest_data, pd.Series) else new_latest_data
+            if pd.isna(old_val) or pd.isna(new_val) or new_val == 0:
+                continue
+            if col == "volume":
+                df[col] = df[col] / (new_val / old_val)
+            else:
+                df[col] = df[col] * (old_val / new_val)
+
+        result = df.iloc[1:] if len(df) > 1 else df.iloc[0:0]
+        return result.reset_index()
 
 
 class YahooNormalizeUS1min(YahooNormalizeUS, YahooNormalize1min):

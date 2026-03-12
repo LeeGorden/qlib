@@ -27,6 +27,7 @@ import multiprocessing
 from pathlib import Path
 from typing import Optional
 
+from tqdm import tqdm
 import fire
 import numpy as np
 import pandas as pd
@@ -401,20 +402,20 @@ def update_qlib_data(
             sym = str(row["symbol"]).upper()
             inst_end_map[sym] = str(row["end_datetime"])
 
+        # Fetch pure online symbols WITHOUT merging all.txt, so we can
+        # distinguish active stocks from potentially delisted ones.
         try:
-            online_raw = get_us_stock_symbols(qlib_data_path=qlib_data_1d_dir)
+            online_raw = get_us_stock_symbols()
         except Exception:
-            try:
-                online_raw = get_us_stock_symbols()
-            except Exception:
-                online_raw = []
+            online_raw = []
         online_raw += ["^GSPC", "^NDX", "^DJI"]
         online_symbols = {code_to_fname(s).upper() for s in online_raw}
 
         all_symbols = existing_symbols | online_symbols
-        new_symbols = all_symbols - existing_symbols
+        new_symbols = online_symbols - existing_symbols
         logger.info(
-            f"Online: {len(online_symbols)}, "
+            f"Existing: {len(existing_symbols)}, "
+            f"Online (active): {len(online_symbols)}, "
             f"New: {len(new_symbols)}, "
             f"Total: {len(all_symbols)}"
         )
@@ -441,9 +442,13 @@ def update_qlib_data(
         failed = 0
         consecutive_failures = 0
 
-        logger.info(f"Scanning {total} symbols for incremental download...")
+        pbar = tqdm(
+            sorted(all_symbols), total=total,
+            desc="Downloading", unit="sym",
+            bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}] {postfix}",
+        )
 
-        for i, sym_fname in enumerate(sorted(all_symbols), 1):
+        for sym_fname in pbar:
             csv_path = source_dir / f"{sym_fname}.csv"
             yahoo_symbol = fname_to_code(sym_fname.lower())
 
@@ -455,22 +460,22 @@ def update_qlib_data(
             if csv_last:
                 if pd.Timestamp(csv_last) >= pd.Timestamp(end_date) - pd.Timedelta(days=UP_TO_DATE_TOLERANCE_DAYS):
                     skipped += 1
+                    pbar.set_postfix(dl=downloaded, skip=skipped, fail=failed, refresh=False)
                     continue
                 dl_start = csv_last
             elif sym_fname in inst_end_map:
+                if sym_fname not in online_symbols:
+                    skipped += 1
+                    pbar.set_postfix(dl=downloaded, skip=skipped, fail=failed, refresh=False)
+                    continue
                 dl_start = inst_end_map[sym_fname]
             else:
                 dl_start = "2000-01-01"
 
             if pd.Timestamp(dl_start) >= pd.Timestamp(end_date):
                 skipped += 1
+                pbar.set_postfix(dl=downloaded, skip=skipped, fail=failed, refresh=False)
                 continue
-
-            if i % 500 == 0:
-                logger.info(
-                    f"  Progress: {i}/{total} "
-                    f"(downloaded={downloaded}, skipped={skipped}, failed={failed})"
-                )
 
             try:
                 time.sleep(delay)
@@ -482,16 +487,22 @@ def update_qlib_data(
                 )
 
                 if raw_df is None or raw_df.empty:
-                    consecutive_failures += 1
                     failed += 1
+                    # Only count toward rate-limit detection if the stock
+                    # is expected to be active (present in online list).
+                    # Stocks only in instruments but not online are likely
+                    # delisted — empty data is normal, not a rate limit.
+                    if sym_fname in online_symbols:
+                        consecutive_failures += 1
                     failure_logger.log(
                         yahoo_symbol, dl_start, end_date, "empty_data",
                         "All sources returned no data"
                     )
+                    pbar.set_postfix(dl=downloaded, skip=skipped, fail=failed, refresh=False)
                     if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
                         logger.error(
                             f"Rate limit likely ({consecutive_failures} consecutive "
-                            f"failures). Stopping download loop."
+                            f"failures on active stocks). Stopping download loop."
                         )
                         break
                     continue
@@ -521,7 +532,9 @@ def update_qlib_data(
                     try:
                         existing_df = pd.read_csv(csv_path, dtype={"symbol": str})
                         combined = pd.concat([existing_df, raw_df], ignore_index=True)
-                        combined["_dt"] = pd.to_datetime(combined["date"], format="mixed")
+                        combined["_dt"] = pd.to_datetime(
+                            combined["date"], format="mixed", utc=True
+                        ).dt.tz_localize(None)
                         combined = combined.drop_duplicates(subset=["_dt"], keep="last")
                         combined = combined.sort_values("_dt").reset_index(drop=True)
                         combined["date"] = combined["_dt"].dt.strftime("%Y-%m-%d")
@@ -533,6 +546,7 @@ def update_qlib_data(
                     raw_df.to_csv(csv_path, index=False)
 
                 downloaded += 1
+                pbar.set_postfix(dl=downloaded, skip=skipped, fail=failed, refresh=False)
 
             except RateLimitError:
                 logger.error("Rate limit detected. Stopping download loop.")
@@ -541,6 +555,7 @@ def update_qlib_data(
             except Exception as e:
                 consecutive_failures += 1
                 failed += 1
+                pbar.set_postfix(dl=downloaded, skip=skipped, fail=failed, refresh=False)
                 failure_logger.log(yahoo_symbol, dl_start, end_date, "error", str(e))
                 if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
                     logger.error(
@@ -549,6 +564,7 @@ def update_qlib_data(
                     )
                     break
 
+        pbar.close()
         logger.info(
             f"Download complete: {downloaded} downloaded, "
             f"{skipped} skipped, {failed} failed (out of {total})"
