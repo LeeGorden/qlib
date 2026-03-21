@@ -39,6 +39,13 @@ sys.path.insert(0, str(ALL_SOURCE_DIR))
 import qlib
 from qlib.utils import exists_qlib_data, fname_to_code, code_to_fname
 
+# Qlib instrument name → actual Yahoo Finance ticker
+# Used when the Yahoo ticker contains characters invalid in filenames (^, =, etc.)
+YAHOO_TICKER_OVERRIDE = {
+    "VIX": "^VIX",    # CBOE Volatility Index
+    "DXY": "DX=F",    # ICE US Dollar Index Futures
+}
+
 
 class FailureLogger:
     """Log failed stock downloads to CSV and console."""
@@ -224,17 +231,54 @@ def update_single_stock(
 
     from update_qlib_data import _fetch_stock_data_multi_source
 
-    try:
-        raw_df = _fetch_stock_data_multi_source(
-            symbol_yahoo=symbol,
-            symbol_fname=symbol_fname,
-            start=start_date,
-            end=end_date,
-        )
-    except Exception as e:
-        failure_logger.log(symbol, start_date, end_date, "network_error", str(e))
-        failure_logger.save()
-        return
+    symbol_yahoo = YAHOO_TICKER_OVERRIDE.get(symbol_upper, symbol_upper)
+    if symbol_yahoo != symbol_upper:
+        logger.info(f"Using Yahoo ticker override: {symbol_upper} → {symbol_yahoo}")
+
+    # For YAHOO_TICKER_OVERRIDE symbols (e.g. ^VIX), bypass the multi-source fetcher
+    # and use yfinance directly — the multi-source fetcher can't handle ^ in tickers.
+    if symbol_upper in YAHOO_TICKER_OVERRIDE:
+        try:
+            import yfinance as yf
+            yf_df = yf.download(symbol_yahoo, start=start_date, end=end_date,
+                                progress=False, auto_adjust=True)
+            if yf_df.empty:
+                failure_logger.log(symbol, start_date, end_date, "empty_data",
+                                   f"yfinance returned no data for {symbol_yahoo}")
+                failure_logger.save()
+                return
+            if isinstance(yf_df.columns, pd.MultiIndex):
+                yf_df.columns = yf_df.columns.droplevel(1)
+            yf_df = yf_df.rename(columns={
+                "Open": "open", "High": "high", "Low": "low",
+                "Close": "close", "Volume": "volume",
+            })
+            yf_df.index.name = "date"
+            yf_df = yf_df.reset_index()
+            yf_df["date"] = pd.to_datetime(yf_df["date"]).dt.tz_localize(None)
+            yf_df["adjclose"] = yf_df["close"]   # index data — no splits/dividends
+            # Normalizer drops rows where volume <= 0; use 1 as placeholder for index data
+            yf_df["volume"] = yf_df["volume"].replace(0, 1).fillna(1).clip(lower=1)
+            yf_df["symbol"] = symbol_fname
+            raw_df = yf_df[["date", "open", "high", "low", "close",
+                             "volume", "adjclose", "symbol"]]
+            logger.info(f"yfinance fetched {len(raw_df)} rows for {symbol_yahoo}")
+        except Exception as e:
+            failure_logger.log(symbol, start_date, end_date, "network_error", str(e))
+            failure_logger.save()
+            return
+    else:
+        try:
+            raw_df = _fetch_stock_data_multi_source(
+                symbol_yahoo=symbol_yahoo,
+                symbol_fname=symbol_fname,
+                start=start_date,
+                end=end_date,
+            )
+        except Exception as e:
+            failure_logger.log(symbol, start_date, end_date, "network_error", str(e))
+            failure_logger.save()
+            return
 
     if raw_df is None or raw_df.empty:
         failure_logger.log(
@@ -459,8 +503,11 @@ def batch_update(
     symbols = []
     for line in symbols_path.read_text(encoding="utf-8").splitlines():
         s = line.strip()
-        if s and not s.startswith("#"):
-            symbols.append(s.upper())
+        if not s or s.startswith("#") or s.startswith("["):
+            continue                         # skip comments, section/group headers
+        symbol = s.split("|")[0].strip().upper()  # support "SYMBOL | description" format
+        if symbol:
+            symbols.append(symbol)
 
     if not symbols:
         logger.warning("No symbols found in file.")
